@@ -30,10 +30,10 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 
-	sandboxv1alpha1 "github.com/cocoonstack/cocoon-sandbox-operator/api/v1alpha1"
-	sandboxv1beta1 "github.com/cocoonstack/cocoon-sandbox-operator/api/v1beta1"
-	extv1alpha1 "github.com/cocoonstack/cocoon-sandbox-operator/extensions/api/v1alpha1"
-	extv1beta1 "github.com/cocoonstack/cocoon-sandbox-operator/extensions/api/v1beta1"
+	sandboxv1alpha1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1alpha1"
+	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
+	extv1alpha1 "github.com/doge-rgb/cocoon-sandbox-operator/extensions/api/v1alpha1"
+	extv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/extensions/api/v1beta1"
 )
 
 const image = "m.daocloud.io/docker.io/library/alpine:3.20"

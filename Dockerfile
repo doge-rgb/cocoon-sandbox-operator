@@ -19,7 +19,7 @@ COPY extensions/ ./extensions/
 COPY internal/ ./internal/
 COPY pkg/ ./pkg/
 RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build \
-    -ldflags="-s -w -X github.com/cocoonstack/cocoon-sandbox-operator/internal/version.gitVersion=${GIT_VERSION} -X github.com/cocoonstack/cocoon-sandbox-operator/internal/version.gitSHA=${GIT_SHA} -X github.com/cocoonstack/cocoon-sandbox-operator/internal/version.buildDate=${BUILD_DATE}" \
+    -ldflags="-s -w -X github.com/doge-rgb/cocoon-sandbox-operator/internal/version.gitVersion=${GIT_VERSION} -X github.com/doge-rgb/cocoon-sandbox-operator/internal/version.gitSHA=${GIT_SHA} -X github.com/doge-rgb/cocoon-sandbox-operator/internal/version.buildDate=${BUILD_DATE}" \
     -o /cocoon-sandbox-operator ./cmd/cocoon-sandbox-operator
 
 FROM gcr.io/distroless/static-debian13:nonroot

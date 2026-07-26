@@ -19,7 +19,7 @@ spec:
       serviceAccountName: cocoon-sandbox-operator
       containers:
       - name: cocoon-sandbox-operator
-        image: ko://github.com/cocoonstack/cocoon-sandbox-operator/cmd/cocoon-sandbox-operator # placeholder value, replaced by deployment scripts
+        image: ko://github.com/doge-rgb/cocoon-sandbox-operator/cmd/cocoon-sandbox-operator # placeholder value, replaced by deployment scripts
         args:
         - "--leader-elect=true"
         - "--extensions=true"

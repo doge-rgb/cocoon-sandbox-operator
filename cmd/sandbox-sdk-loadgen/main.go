@@ -65,8 +65,8 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/config"
 
-	sandboxv1beta1 "github.com/cocoonstack/cocoon-sandbox-operator/api/v1beta1"
 	sdk "github.com/cocoonstack/sandbox/sdk/go"
+	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
 )
 
 // version is stamped at build time (-ldflags "-X main.version=...").

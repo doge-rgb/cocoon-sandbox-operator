@@ -24,7 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/cocoonstack/cocoon-sandbox-operator/pkg/scale/sandboxd"
+	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale/sandboxd"
 )
 
 // poolInv builds a NodeInventory advertising a sandboxd address and pool capacities.

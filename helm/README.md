@@ -45,7 +45,7 @@ Do not delete the CRDs while sandbox custom resources still exist.
 
 | Parameter | Description | Default |
 |---|---|---|
-| `image.repository` | Operator image repository | `ghcr.io/cocoonstack/cocoon-sandbox-operator` |
+| `image.repository` | Operator image repository | `ghcr.io/doge-rgb/cocoon-sandbox-operator` |
 | `image.tag` | Operator image tag; required | `""` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `replicaCount` | Operator replicas | `1` |

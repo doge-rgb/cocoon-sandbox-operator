@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/cocoonstack/cocoon-sandbox-operator/cocoon/sandboxd"
+	"github.com/doge-rgb/cocoon-sandbox-operator/cocoon/sandboxd"
 )
 
 func TestClientClaimFollowsOneRedirect(t *testing.T) {

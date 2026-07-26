@@ -91,7 +91,7 @@ to vendor the types:
 
 ```go
 import (
-    sandboxv1beta1 "github.com/cocoonstack/cocoon-sandbox-operator/api/v1beta1"
+    sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
     "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -262,7 +262,7 @@ helm upgrade --install cocoon-sandbox-operator ./helm \
 Kustomize (replace the `ko://` image reference):
 
 ```bash
-kustomize build k8s | sed 's#ko://.*/cocoon-sandbox-operator#ghcr.io/cocoonstack/cocoon-sandbox-operator:<version>#' | kubectl apply -f -
+kustomize build k8s | sed 's#ko://.*/cocoon-sandbox-operator#ghcr.io/doge-rgb/cocoon-sandbox-operator:<version>#' | kubectl apply -f -
 ```
 
 The default (standard-kubelet) backend needs no special nodes. The `vk-cocoon`

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cocoonstack/cocoon-sandbox-operator/internal/version"
+	"github.com/doge-rgb/cocoon-sandbox-operator/internal/version"
 	"github.com/go-logr/logr"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"

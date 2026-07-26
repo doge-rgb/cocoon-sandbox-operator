@@ -7,9 +7,9 @@ keywords:
   - agent
   - sandbox
   - kubernetes
-home: https://github.com/cocoonstack/cocoon-sandbox-operator
+home: https://github.com/doge-rgb/cocoon-sandbox-operator
 sources:
-  - https://github.com/cocoonstack/cocoon-sandbox-operator
+  - https://github.com/doge-rgb/cocoon-sandbox-operator
   - https://github.com/kubernetes-sigs/agent-sandbox
 maintainers:
   - name: CocoonStack
