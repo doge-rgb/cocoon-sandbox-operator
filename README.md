@@ -228,6 +228,27 @@ directly rather than importing an SDK, because e2b publishes JS and Python
 clients but no Go one; that exercises the wire contract, not the SDKs
 themselves.
 
+[`examples/lifecycle/example-e2b.py`](examples/lifecycle/example-e2b.py) closes
+that gap by importing the real `e2b` package from PyPI, unmodified, and running
+the same lifecycle plus a 100-sandbox concurrent pass. Two deployment facts it
+had to encode, both worth knowing before pointing a real client here:
+
+- **`allow_internet_access` selects the warm pool, and the SDK defaults it to
+  `True`.** True picks the egress network lane; the pools this repo benchmarks
+  are on the no-egress lane, so the SDK's *default* create answers 503 "no warm
+  sandbox available". Pass `allow_internet_access=False`, or provision an
+  egress-lane `SandboxWarmPool`.
+- **The SDK does not poll for read-view visibility.** Create returns as soon as
+  the node-local claim completes, but every other verb resolves through the
+  synthesized view, so `create` immediately followed by `pause` raises
+  `SandboxNotFoundException` until the owning node republishes. The example
+  polls with ordinary SDK calls; the fix that removes the window is the
+  [L3 follow-up](#l3-follow-up-resolve-a-sandbox-without-the-summary-todo).
+
+Data-plane methods (`is_running`, `commands`, `files`, `pty`) reach envd inside
+the guest at `{port}-{id}.{domain}`, which needs `--e2b-domain` plus wildcard DNS
+routed to the sandboxes; the example does not exercise them.
+
 ## Install
 
 Helm:

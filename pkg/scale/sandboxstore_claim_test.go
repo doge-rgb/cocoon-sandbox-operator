@@ -16,6 +16,7 @@ package scale
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	"github.com/go-logr/logr"
@@ -79,16 +80,17 @@ func (c *recordingClient) Release(_ context.Context, id, token string) error {
 	return c.f.releaseErr
 }
 
-func TestStoreClaim_PicksMostWarmNodeAndRoutes(t *testing.T) {
+func TestStoreClaim_RoutesToAWarmNode(t *testing.T) {
 	src := NewStaticInventorySource()
-	src.Put(poolInv("n1", "10.0.0.1:7777", PoolCapacity{Template: "img", Warm: 1, Target: 5}))
+	src.Put(poolInv("n1", "10.0.0.1:7777", PoolCapacity{Template: "img", Warm: 0, Target: 5}))
 	src.Put(poolInv("n2", "10.0.0.2:7777", PoolCapacity{Template: "img", Warm: 4, Target: 5}))
 	f := &recordingFactory{claimResult: sandboxd.ClaimResult{ID: "sb-abc", Token: "sbtok", OwnerAddr: "10.0.0.2:9000"}}
 	store := NewScatterGatherStore(src, WithLogger(logr.Discard()), WithClaimRouting("uniform-token", f.factory()))
 
 	a, err := store.Claim(context.Background(), "ns", "s1", PoolKey{Template: "img"})
 	require.NoError(t, err)
-	// Most-warm-first picks n2, and the assignment carries the sandboxd id + address.
+	// n1 advertises no warm capacity, so the only viable node is n2, and the
+	// assignment carries the sandboxd id + address.
 	assert.Equal(t, "n2", a.Node)
 	assert.Equal(t, "sb-abc", a.SandboxName)
 	assert.Equal(t, "10.0.0.2:9000", a.Address)
@@ -100,6 +102,38 @@ func TestStoreClaim_PicksMostWarmNodeAndRoutes(t *testing.T) {
 	// its operator index and the aggregated read path can resolve this sandbox.
 	assert.Equal(t, "ns/s1", f.claimSpec.ClaimRef)
 	assert.Equal(t, 1, f.claimCalls)
+}
+
+// TestStoreClaim_SpreadsAcrossNodesWithinOneInventoryGeneration pins the
+// property that makes concurrent claims usable: the warm counts come from a
+// summary republished every ~30s, so a burst inside one generation reads
+// identical numbers. Routing by "largest wins" would send all of it to one node
+// until that node drained and answered no-capacity, with the rest of the fleet
+// untouched — which is exactly what a 100-sandbox burst did before this.
+func TestStoreClaim_SpreadsAcrossNodesWithinOneInventoryGeneration(t *testing.T) {
+	src := NewStaticInventorySource()
+	for _, n := range []string{"n1", "n2", "n3", "n4"} {
+		src.Put(poolInv(n, "10.0.0."+n[1:]+":7777", PoolCapacity{Template: "img", Warm: 5, Target: 5}))
+	}
+	f := &recordingFactory{claimResult: sandboxd.ClaimResult{ID: "sb-abc", Token: "sbtok"}}
+	store := NewScatterGatherStore(src, WithLogger(logr.Discard()), WithClaimRouting("tok", f.factory()))
+
+	// The inventory never changes, so every claim below sees Warm: 5 on all four.
+	picked := map[string]int{}
+	for i := range 20 {
+		a, err := store.Claim(context.Background(), "ns", fmt.Sprintf("s%d", i), PoolKey{Template: "img"})
+		require.NoError(t, err)
+		picked[a.Node]++
+	}
+	assert.Len(t, picked, 4, "every node with warm capacity should take a share, got %v", picked)
+	for node, got := range picked {
+		assert.LessOrEqual(t, got, 5, "node %q took %d of 20 claims but advertised only 5 warm", node, got)
+	}
+
+	// Exhausting the advertised capacity answers no-capacity rather than
+	// overcommitting a node whose count this generation is already spent.
+	_, err := store.Claim(context.Background(), "ns", "overflow", PoolKey{Template: "img"})
+	assert.ErrorIs(t, err, ErrNoWarmCapacity)
 }
 
 func TestStoreClaim_NoWarmCapacityIsRetryable(t *testing.T) {

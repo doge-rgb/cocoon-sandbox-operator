@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"math/rand/v2"
 	"net"
 	"sort"
 	"strings"
@@ -155,6 +156,50 @@ type scatterGatherStore struct {
 	// which is what gates the write path (Claim/Release).
 	sandboxdToken   string
 	sandboxdFactory SandboxdClientFactory
+
+	// reservations debit the warm counts pickWarmNode reads, because those
+	// counts are a NodeInventory summary republished on a ~30s cadence: within
+	// one generation every concurrent claim sees the same numbers. Picking the
+	// single largest would send the whole burst to one node until it drains and
+	// answers no-capacity, while the rest of the fleet sits idle.
+	reservations sync.Map // nodePool -> *reservation
+}
+
+// nodePool keys a reservation to one node's capacity for one pool.
+type nodePool struct {
+	node string
+	pool PoolKey
+}
+
+// reservation tracks claims handed to a node since its inventory last changed.
+// generation is the inventory's ResourceVersion: a new one means fresh counts
+// that already reflect those claims, so the debit resets.
+type reservation struct {
+	mu         sync.Mutex
+	generation string
+	taken      int
+}
+
+// debit returns the reservation's count for generation, resetting it first if
+// the node has published since, and optionally records one more claim.
+func (r *reservation) debit(generation string, take bool) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.generation != generation {
+		r.generation, r.taken = generation, 0
+	}
+	if take {
+		r.taken++
+	}
+	return r.taken
+}
+
+func (s *scatterGatherStore) reservationFor(node string, pool PoolKey) *reservation {
+	if r, ok := s.reservations.Load(nodePool{node, pool}); ok {
+		return r.(*reservation)
+	}
+	r, _ := s.reservations.LoadOrStore(nodePool{node, pool}, &reservation{})
+	return r.(*reservation)
 }
 
 // Compile-time assertions for the L3 contracts.
@@ -339,12 +384,30 @@ func (s *scatterGatherStore) Release(ctx context.Context, node, id string) error
 // advertise address) with the most warm capacity for pool. A node with no
 // advertised address is skipped (there is nowhere to route a claim). Returns
 // ErrNoWarmCapacity when no node has Warm>0 for the pool.
+// pickWarmNode chooses a node that advertises warm capacity for pool, spreading
+// concurrent claims across the fleet rather than stacking them on whichever node
+// the last inventory publish happened to show as largest.
+//
+// Two things make the naive "largest wins" wrong here. The counts come from a
+// NodeInventory summary republished every ~30s, so a burst of claims inside one
+// generation all read the same numbers and would all pick the same node — it
+// drains, answers no-capacity, and the remaining fleet never gets asked. And
+// even with fresh counts, a deterministic maximum serializes a fleet's worth of
+// demand onto one node. So: debit each node by the claims already routed to it
+// this generation, then choose among the survivors weighted by what is left.
+// Weighting keeps the pool balanced (a node with twice the warm takes twice the
+// share) while the randomness breaks the stampede.
 func (s *scatterGatherStore) pickWarmNode(ctx context.Context, pool PoolKey) (node, addr string, err error) {
 	nodes, err := s.src.ListNodes(ctx)
 	if err != nil {
 		return "", "", fmt.Errorf("scale: enumerate node inventories: %w", err)
 	}
-	bestWarm := 0
+	type candidate struct {
+		node, addr, generation string
+		available              int
+	}
+	var candidates []candidate
+	total := 0
 	for _, n := range nodes {
 		inv, err := s.src.NodeInventory(ctx, n)
 		if err != nil {
@@ -357,15 +420,35 @@ func (s *scatterGatherStore) pickWarmNode(ctx context.Context, pool PoolKey) (no
 		}
 		for i := range inv.Pools {
 			pc := inv.Pools[i]
-			if pc.Warm > bestWarm && poolCapacityMatches(pc, pool) {
-				bestWarm, node, addr = pc.Warm, n, inv.Address
+			if !poolCapacityMatches(pc, pool) {
+				continue
 			}
+			available := pc.Warm - s.reservationFor(n, pool).debit(inv.ResourceVersion, false)
+			if available <= 0 {
+				continue
+			}
+			candidates = append(candidates, candidate{n, inv.Address, inv.ResourceVersion, available})
+			total += available
+			break
 		}
 	}
-	if node == "" {
+	if len(candidates) == 0 {
 		return "", "", ErrNoWarmCapacity
 	}
-	return node, addr, nil
+	// Weighted draw: walk the candidates subtracting each one's share until the
+	// draw is spent. Sorted first so the choice does not ride on map iteration.
+	sort.Slice(candidates, func(i, j int) bool { return candidates[i].node < candidates[j].node })
+	draw := rand.IntN(total) //nolint:gosec // spreading load, not a security decision
+	for _, c := range candidates {
+		if draw < c.available {
+			s.reservationFor(c.node, pool).debit(c.generation, true)
+			return c.node, c.addr, nil
+		}
+		draw -= c.available
+	}
+	last := candidates[len(candidates)-1]
+	s.reservationFor(last.node, pool).debit(last.generation, true)
+	return last.node, last.addr, nil
 }
 
 // poolCapacityMatches reports whether a node's advertised pool capacity serves the

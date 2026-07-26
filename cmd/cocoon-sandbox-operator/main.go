@@ -79,6 +79,7 @@ func main() {
 	var sandboxWarmPoolMaxBatchSize int
 	var enableWarmPoolEviction bool
 	var sandboxWarmPoolDisableCRManagement bool
+	var webhookOnly bool
 	var printVersion bool
 	var webhookPort int
 	var webhookCertDir string
@@ -126,6 +127,12 @@ func main() {
 		"Disable per-CR Sandbox create/delete in the SandboxWarmPool controller (status-only). "+
 			"Use with the L3 writable-aggregation design, where warm capacity is driven per-node by sandboxd "+
 			"and CR-based replenishment would fight the aggregated node-local claim path.")
+	flag.BoolVar(&webhookOnly, "webhook-only", false,
+		"Serve only the webhooks (conversion and defaulting) and run no controllers. "+
+			"This is the aggregated (L3) shape: the aggregated apiserver owns claims, warm-pool "+
+			"supply, and the Sandbox read view, and sandboxes are node-local microVMs that were "+
+			"never Kubernetes objects — so the reconcilers here have nothing correct to do, while "+
+			"the CRDs' conversion strategy still points at this process for v1alpha1 clients.")
 	opts := zap.Options{
 		Development: false,
 	}
@@ -315,118 +322,131 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Register the custom Sandbox metric collector globally.
-	asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
+	// In an aggregated (L3) deployment the aggregated apiserver owns the whole data
+	// path — claims, warm-pool supply, and the Sandbox read view — and sandboxes are
+	// node-local microVMs that were never Kubernetes objects. The reconcilers below
+	// maintain the standard-kubelet shape instead, materializing Pods and Sandbox CRs.
+	// Running them there is not merely redundant, it fights the aggregated path: the
+	// SandboxWarmPool controller creates a Sandbox per missing replica, each create
+	// claims a real microVM, and because the aggregated read view is synthesized from
+	// NodeInventory on a ~30s cadence the controller never observes its own creations —
+	// so it creates again, without bound. The webhooks below stay either way: the CRDs'
+	// conversion strategy points here, and v1alpha1 is still served.
+	if webhookOnly {
+		setupLog.Info("webhook-only: serving webhooks, running no controllers")
+	} else {
+		// Register the custom Sandbox metric collector globally.
+		asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
-	if err = (&controllers.SandboxReconciler{
-		Client:        mgr.GetClient(),
-		Scheme:        mgr.GetScheme(),
-		Tracer:        instrumenter,
-		ClusterDomain: clusterDomain,
-		PodMutator:    podMutator,
-	}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
-		os.Exit(1)
+		if err = (&controllers.SandboxReconciler{
+			Client:        mgr.GetClient(),
+			Scheme:        mgr.GetScheme(),
+			Tracer:        instrumenter,
+			ClusterDomain: clusterDomain,
+			PodMutator:    podMutator,
+		}).SetupWithManager(mgr, sandboxConcurrentWorkers); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "Sandbox")
+			os.Exit(1)
+		}
+
+		if err = (&cocooncontroller.CocoonSandboxNodeController{
+			Client: mgr.GetClient(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CocoonSandboxNode")
+			os.Exit(1)
+		}
+		if err = (&cocooncontroller.CocoonSandboxPoolController{
+			Client: mgr.GetClient(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CocoonSandboxPool")
+			os.Exit(1)
+		}
+		if err = (&cocooncontroller.CocoonSandboxController{
+			Client: mgr.GetClient(),
+			Scheme: mgr.GetScheme(),
+		}).SetupWithManager(mgr); err != nil {
+			setupLog.Error(err, "unable to create controller", "controller", "CocoonSandbox")
+			os.Exit(1)
+		}
+
+		if extensions {
+			warmSandboxQueue := queue.NewSimpleSandboxQueue()
+
+			var allowedDomains []string
+			configPath := "/etc/sandbox-config/allowed-label-domains"
+			if data, err := os.ReadFile(configPath); err == nil {
+				val := strings.TrimSpace(string(data))
+				if val != "" {
+					for _, d := range strings.FieldsFunc(val, func(c rune) bool {
+						return c == ',' || c == '\n' || c == '\r'
+					}) {
+						d = strings.ToLower(strings.TrimSpace(d))
+						if d != "" {
+							allowedDomains = append(allowedDomains, d)
+						}
+					}
+				}
+			} else if !os.IsNotExist(err) {
+				setupLog.Error(err, "failed to read configuration file", "path", configPath)
+				os.Exit(1)
+			}
+
+			if err = (&extensionscontrollers.SandboxClaimReconciler{
+				Client:              mgr.GetClient(),
+				Scheme:              mgr.GetScheme(),
+				WarmSandboxQueue:    warmSandboxQueue,
+				Recorder:            mgr.GetEventRecorder("sandboxclaim-controller"),
+				Tracer:              instrumenter,
+				AllowedLabelDomains: allowedDomains,
+			}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
+				os.Exit(1)
+			}
+
+			if err = (&extensionscontrollers.SandboxTemplateReconciler{
+				Client:          mgr.GetClient(),
+				Scheme:          mgr.GetScheme(),
+				Recorder:        mgr.GetEventRecorder("sandboxtemplate-controller"),
+				Tracer:          instrumenter,
+				RouterNamespace: webhookNamespace,
+			}).SetupWithManager(mgr, sandboxTemplateConcurrentWorkers); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", "SandboxTemplate")
+				os.Exit(1)
+			}
+
+			if err = (&extensionscontrollers.SandboxWarmPoolReconciler{
+				Client:                     mgr.GetClient(),
+				Scheme:                     mgr.GetScheme(),
+				MaxBatchSize:               sandboxWarmPoolMaxBatchSize,
+				EnableWarmPoolEviction:     enableWarmPoolEviction,
+				DisableSandboxCRManagement: sandboxWarmPoolDisableCRManagement,
+			}).SetupWithManager(mgr, sandboxWarmPoolConcurrentWorkers); err != nil {
+				setupLog.Error(err, "unable to create controller", "controller", "SandboxWarmPool")
+				os.Exit(1)
+			}
+
+		}
+
 	}
 
+	// Webhooks run in every mode: the CRDs' conversion strategy points at this
+	// process, v1alpha1 is still served, and defaulting must not depend on
+	// whether the reconcilers above are enabled.
 	if err = ctrl.NewWebhookManagedBy(mgr, &sandboxv1beta1.Sandbox{}).
 		Complete(); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "Sandbox")
 		os.Exit(1)
 	}
-
-	if err = (&cocooncontroller.CocoonSandboxNodeController{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CocoonSandboxNode")
-		os.Exit(1)
-	}
-	if err = (&cocooncontroller.CocoonSandboxPoolController{
-		Client: mgr.GetClient(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CocoonSandboxPool")
-		os.Exit(1)
-	}
-	if err = (&cocooncontroller.CocoonSandboxController{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
-	}).SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CocoonSandbox")
-		os.Exit(1)
-	}
-
 	if extensions {
-		warmSandboxQueue := queue.NewSimpleSandboxQueue()
-
-		var allowedDomains []string
-		configPath := "/etc/sandbox-config/allowed-label-domains"
-		if data, err := os.ReadFile(configPath); err == nil {
-			val := strings.TrimSpace(string(data))
-			if val != "" {
-				for _, d := range strings.FieldsFunc(val, func(c rune) bool {
-					return c == ',' || c == '\n' || c == '\r'
-				}) {
-					d = strings.ToLower(strings.TrimSpace(d))
-					if d != "" {
-						allowedDomains = append(allowedDomains, d)
-					}
-				}
+		for name, obj := range map[string]client.Object{
+			"SandboxClaim":    &extensionsv1beta1.SandboxClaim{},
+			"SandboxTemplate": &extensionsv1beta1.SandboxTemplate{},
+			"SandboxWarmPool": &extensionsv1beta1.SandboxWarmPool{},
+		} {
+			if err = ctrl.NewWebhookManagedBy(mgr, obj).Complete(); err != nil {
+				setupLog.Error(err, "unable to create webhook", "webhook", name)
+				os.Exit(1)
 			}
-		} else if !os.IsNotExist(err) {
-			setupLog.Error(err, "failed to read configuration file", "path", configPath)
-			os.Exit(1)
-		}
-
-		if err = (&extensionscontrollers.SandboxClaimReconciler{
-			Client:              mgr.GetClient(),
-			Scheme:              mgr.GetScheme(),
-			WarmSandboxQueue:    warmSandboxQueue,
-			Recorder:            mgr.GetEventRecorder("sandboxclaim-controller"),
-			Tracer:              instrumenter,
-			AllowedLabelDomains: allowedDomains,
-		}).SetupWithManager(mgr, sandboxClaimConcurrentWorkers); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "SandboxClaim")
-			os.Exit(1)
-		}
-
-		if err = (&extensionscontrollers.SandboxTemplateReconciler{
-			Client:          mgr.GetClient(),
-			Scheme:          mgr.GetScheme(),
-			Recorder:        mgr.GetEventRecorder("sandboxtemplate-controller"),
-			Tracer:          instrumenter,
-			RouterNamespace: webhookNamespace,
-		}).SetupWithManager(mgr, sandboxTemplateConcurrentWorkers); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "SandboxTemplate")
-			os.Exit(1)
-		}
-
-		if err = (&extensionscontrollers.SandboxWarmPoolReconciler{
-			Client:                     mgr.GetClient(),
-			Scheme:                     mgr.GetScheme(),
-			MaxBatchSize:               sandboxWarmPoolMaxBatchSize,
-			EnableWarmPoolEviction:     enableWarmPoolEviction,
-			DisableSandboxCRManagement: sandboxWarmPoolDisableCRManagement,
-		}).SetupWithManager(mgr, sandboxWarmPoolConcurrentWorkers); err != nil {
-			setupLog.Error(err, "unable to create controller", "controller", "SandboxWarmPool")
-			os.Exit(1)
-		}
-
-		if err = ctrl.NewWebhookManagedBy(mgr, &extensionsv1beta1.SandboxClaim{}).
-			Complete(); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "SandboxClaim")
-			os.Exit(1)
-		}
-
-		if err = ctrl.NewWebhookManagedBy(mgr, &extensionsv1beta1.SandboxTemplate{}).
-			Complete(); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "SandboxTemplate")
-			os.Exit(1)
-		}
-
-		if err = ctrl.NewWebhookManagedBy(mgr, &extensionsv1beta1.SandboxWarmPool{}).
-			Complete(); err != nil {
-			setupLog.Error(err, "unable to create webhook", "webhook", "SandboxWarmPool")
-			os.Exit(1)
 		}
 	}
 
