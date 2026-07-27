@@ -16,12 +16,14 @@ package scale
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"hash/fnv"
 	"math/rand/v2"
 	"net"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +123,24 @@ type SandboxdClientFactory func(addr, token string) SandboxdClient
 // fleet-wide sandboxd api_token presented on claim/release, and factory builds a
 // per-node sandboxd client for a node's advertise address. Without it, Claim and
 // Release fail closed and the store stays read-only.
+// ClaimOption carries optional facts about one claim.
+type ClaimOption func(*claimConfig)
+
+type claimConfig struct{ ownerUID string }
+
+// WithOwnerUID records the UID of the SandboxClaim that is creating this
+// sandbox, so the synthesized object reports an ownerReference the creating
+// controller recognizes as its own.
+func WithOwnerUID(uid string) ClaimOption {
+	return func(c *claimConfig) { c.ownerUID = uid }
+}
+
+// WithClock replaces the store's clock. Tests use it to age pending claims past
+// their TTL without sleeping.
+func WithClock(now func() time.Time) StoreOption {
+	return func(s *scatterGatherStore) { s.clock = now }
+}
+
 func WithClaimRouting(token string, factory SandboxdClientFactory) StoreOption {
 	return func(s *scatterGatherStore) {
 		s.sandboxdToken = token
@@ -163,7 +183,39 @@ type scatterGatherStore struct {
 	// single largest would send the whole burst to one node until it drains and
 	// answers no-capacity, while the rest of the fleet sits idle.
 	reservations sync.Map // nodePool -> *reservation
+
+	// pending gives the store read-your-writes over an inventory that only
+	// republishes every ~30s. Without it a caller that creates a sandbox cannot
+	// see it for most of a minute, and the standard controller shape — create,
+	// re-read, act — reads its own creation as absent and creates again, claiming
+	// a second microVM under the same name. It also makes the claim itself
+	// idempotent: a repeat claim for a live name is refused rather than served
+	// from the warm pool a second time.
+	pending sync.Map // "<ns>/<name>" -> *pendingClaim
+
+	// overlays hold what clients wrote onto synthesized sandboxes, keyed
+	// "<ns>/<name>". See SandboxStore.Overlay for why a read-only projection of
+	// node state still has to accept writes.
+	overlays sync.Map // "<ns>/<name>" -> SandboxOverlay
+
+	// clock is time.Now unless a test replaces it to age pending entries.
+	clock func() time.Time
 }
+
+// pendingClaim is one claim the store has made but has not yet seen echoed back
+// in its node's inventory.
+type pendingClaim struct {
+	node  string
+	entry InventoryEntry
+	at    time.Time
+}
+
+// pendingTTL bounds how long a claim is served from the pending index without
+// inventory confirmation. It must exceed the publish cadence by enough that a
+// single missed publish does not blink the sandbox out of existence, and stay
+// short enough that a claim whose node died stops being advertised. Entries
+// normally leave far sooner, evicted the moment inventory catches up.
+const pendingTTL = 3 * time.Minute
 
 // nodePool keys a reservation to one node's capacity for one pool.
 type nodePool struct {
@@ -255,6 +307,7 @@ func (s *scatterGatherStore) List(ctx context.Context, opts ListOptions) (*sandb
 					"node", node, "err", err.Error())
 				return nil
 			}
+			s.reconcilePending(inv)
 			perNode[i] = s.materialize(inv, opts.Namespace, labelSel, fieldSel)
 			return nil
 		})
@@ -270,16 +323,49 @@ func (s *scatterGatherStore) List(ctx context.Context, opts ListOptions) (*sandb
 	list := &sandboxv1beta1.SandboxList{}
 	list.SetGroupVersionKind(sandboxv1beta1.GroupVersion.WithKind("SandboxList"))
 	list.Items = make([]sandboxv1beta1.Sandbox, 0, total)
+	seen := make(map[string]struct{}, total)
 	for _, chunk := range perNode {
 		list.Items = append(list.Items, chunk...)
+		for j := range chunk {
+			seen[chunk[j].Namespace+"/"+chunk[j].Name] = struct{}{}
+		}
 	}
+	list.Items = append(list.Items, s.unconfirmed(seen, opts.Namespace, labelSel, fieldSel)...)
 	sort.Slice(list.Items, func(a, b int) bool {
 		if list.Items[a].Namespace != list.Items[b].Namespace {
 			return list.Items[a].Namespace < list.Items[b].Namespace
 		}
 		return list.Items[a].Name < list.Items[b].Name
 	})
+	// A List with no ResourceVersion leaves an informer with nothing to resume a
+	// watch from, so it restarts the watch forever and never reports synced.
+	// There is no etcd revision here to quote — the collection is synthesized —
+	// so publish the max NodeInventory ResourceVersion: it is monotonic per node,
+	// it changes exactly when the synthesized contents can change, and Watch
+	// republishes it in bookmarks so the client's cursor keeps advancing.
+	list.SetResourceVersion(s.collectionResourceVersion(ctx, nodes))
 	return list, nil
+}
+
+// collectionResourceVersion summarizes the inventory generation the synthesized
+// collection was built from. Kubernetes treats a resourceVersion as opaque, so
+// the only contract to honor is that it advances when the contents can have
+// changed — the max of the per-node inventory versions does exactly that.
+func (s *scatterGatherStore) collectionResourceVersion(ctx context.Context, nodes []string) string {
+	var max uint64
+	for _, n := range nodes {
+		inv, err := s.src.NodeInventory(ctx, n)
+		if err != nil || inv.ResourceVersion == "" {
+			continue
+		}
+		if v, err := strconv.ParseUint(inv.ResourceVersion, 10, 64); err == nil && v > max {
+			max = v
+		}
+	}
+	if max == 0 {
+		return "1"
+	}
+	return strconv.FormatUint(max, 10)
 }
 
 // Get routes to the owning node's authoritative inventory. It resolves which
@@ -302,11 +388,17 @@ func (s *scatterGatherStore) Get(ctx context.Context, namespace, name string) (*
 			continue
 		}
 		for i := range inv.Entries {
-			ens, ename := splitNamespacedName(inv.Entries[i].Name)
+			ens, ename, _ := parseClaimRef(inv.Entries[i].Name)
 			if ens == namespace && ename == name {
-				return entryToSandbox(inv.Node, inv.Entries[i]), nil
+				s.forgetClaim(namespace, name)
+				return s.applyOverlay(entryToSandbox(inv.Node, inv.Entries[i])), nil
 			}
 		}
+	}
+	// Not in any published inventory: it may simply be newer than the last
+	// publish. Serve the claim the store itself made.
+	if pc, ok := s.pendingFor(namespace, name); ok {
+		return s.applyOverlay(entryToSandbox(pc.node, pc.entry)), nil
 	}
 	return nil, k8serrors.NewNotFound(sandboxv1beta1.Resource("sandboxes"), name)
 }
@@ -320,6 +412,14 @@ func (s *scatterGatherStore) Get(ctx context.Context, namespace, name string) (*
 // Test it with IsNoWarmCapacity rather than comparing directly.
 var ErrNoWarmCapacity = errors.New("scale: no node has warm capacity for the requested pool")
 
+// ErrClaimExists is returned by Claim when the store already holds a live claim
+// for that namespace/name. The aggregated apiserver maps it to 409 AlreadyExists,
+// which is what a controller retrying its own create expects to see.
+var ErrClaimExists = errors.New("scale: a sandbox of that name is already claimed")
+
+// IsClaimExists reports whether err means the name is already claimed.
+func IsClaimExists(err error) bool { return errors.Is(err, ErrClaimExists) }
+
 // IsNoWarmCapacity reports whether err means Claim found no warm node.
 func IsNoWarmCapacity(err error) bool { return errors.Is(err, ErrNoWarmCapacity) }
 
@@ -327,9 +427,20 @@ func IsNoWarmCapacity(err error) bool { return errors.Is(err, ErrNoWarmCapacity)
 // its already-running microVMs via that node's sandboxd, returning the assignment.
 // No per-sandbox object is written to etcd. It fails closed if claim routing is
 // not configured, and returns ErrNoWarmCapacity when no warm node is available.
-func (s *scatterGatherStore) Claim(ctx context.Context, namespace, name string, pool PoolKey) (Assignment, error) {
+func (s *scatterGatherStore) Claim(ctx context.Context, namespace, name string, pool PoolKey, opts ...ClaimOption) (Assignment, error) {
+	var cfg claimConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	if s.sandboxdFactory == nil {
 		return Assignment{}, fmt.Errorf("scale: claim routing not configured (call WithClaimRouting)")
+	}
+	// Idempotency. The caller cannot distinguish "my create was lost" from "my
+	// create landed but is not visible yet", so a controller retry is normal and
+	// must not consume a second warm microVM under the same name.
+	if pc, ok := s.pendingFor(namespace, name); ok {
+		return Assignment{}, fmt.Errorf("scale: claim %s/%s on node %q: %w",
+			namespace, name, pc.node, ErrClaimExists)
 	}
 	node, addr, err := s.pickWarmNode(ctx, pool)
 	if err != nil {
@@ -342,7 +453,7 @@ func (s *scatterGatherStore) Claim(ctx context.Context, namespace, name string, 
 		// Name the claim by the k8s object so the node's operator index echoes it
 		// back and the aggregated read path (List/Get) resolves this sandbox by
 		// "<namespace>/<name>".
-		ClaimRef: namespace + "/" + name,
+		ClaimRef: formatClaimRef(namespace, name, cfg.ownerUID),
 	})
 	if err != nil {
 		if errors.Is(err, sandboxd.ErrNodeAtCapacity) {
@@ -352,6 +463,13 @@ func (s *scatterGatherStore) Claim(ctx context.Context, namespace, name string, 
 		}
 		return Assignment{}, fmt.Errorf("scale: claim %s/%s on node %q: %w", namespace, name, node, err)
 	}
+	s.rememberClaim(namespace, name, node, InventoryEntry{
+		Name:     namespace + "/" + name,
+		ID:       res.ID,
+		Phase:    "Running",
+		ClaimRef: formatClaimRef(namespace, name, cfg.ownerUID),
+		Address:  res.OwnerAddr,
+	})
 	return Assignment{SandboxName: res.ID, Node: node, Address: res.OwnerAddr, Token: res.Token}, nil
 }
 
@@ -377,7 +495,138 @@ func (s *scatterGatherStore) Release(ctx context.Context, node, id string) error
 	if err := s.sandboxdFactory(inv.Address, s.sandboxdToken).Release(ctx, id, s.sandboxdToken); err != nil {
 		return fmt.Errorf("scale: sandboxd release of %q on node %q: %w", id, node, err)
 	}
+	// Stop serving the released claim from the pending index; inventory would
+	// otherwise take a publish cycle to stop reporting it.
+	s.pending.Range(func(k, v any) bool {
+		if v.(*pendingClaim).entry.ID == id {
+			s.pending.Delete(k)
+			s.overlays.Delete(k)
+			return false
+		}
+		return true
+	})
 	return nil
+}
+
+// Overlay records client-written metadata for namespace/name.
+func (s *scatterGatherStore) Overlay(_ context.Context, namespace, name string, ov SandboxOverlay) error {
+	s.overlays.Store(namespace+"/"+name, ov)
+	return nil
+}
+
+// applyOverlay merges any recorded client writes onto a freshly synthesized
+// sandbox. Node-derived fields are computed first so status and phase stay live;
+// the overlay only re-applies what a client set on top.
+func (s *scatterGatherStore) applyOverlay(sb *sandboxv1beta1.Sandbox) *sandboxv1beta1.Sandbox {
+	v, ok := s.overlays.Load(sb.Namespace + "/" + sb.Name)
+	if !ok {
+		return sb
+	}
+	ov := v.(SandboxOverlay)
+	sb.Labels = mergeOverlayMap(sb.Labels, ov.Labels)
+	sb.Annotations = mergeOverlayMap(sb.Annotations, ov.Annotations)
+	if ov.Spec != nil {
+		sb.Spec = *ov.Spec.DeepCopy()
+	}
+	return sb
+}
+
+// mergeOverlayMap applies written keys onto base, treating an empty value as a
+// removal so a client can delete a key it does not want.
+func mergeOverlayMap(base, written map[string]string) map[string]string {
+	if len(written) == 0 {
+		return base
+	}
+	if base == nil {
+		base = map[string]string{}
+	}
+	for k, v := range written {
+		if v == "" {
+			delete(base, k)
+			continue
+		}
+		base[k] = v
+	}
+	return base
+}
+
+// forgetOverlay drops the recorded writes for a sandbox that no longer exists.
+func (s *scatterGatherStore) forgetOverlay(namespace, name string) {
+	s.overlays.Delete(namespace + "/" + name)
+}
+
+// rememberClaim records a claim so Get/List can serve it before the owning
+// node's next inventory publish.
+func (s *scatterGatherStore) rememberClaim(namespace, name, node string, e InventoryEntry) {
+	s.pending.Store(namespace+"/"+name, &pendingClaim{node: node, entry: e, at: s.now()})
+}
+
+// forgetClaim drops a pending entry (released, or confirmed by inventory).
+func (s *scatterGatherStore) forgetClaim(namespace, name string) {
+	s.pending.Delete(namespace + "/" + name)
+}
+
+// pendingFor returns the unconfirmed claim for namespace/name, if one is live.
+// An expired entry is evicted and reported absent.
+func (s *scatterGatherStore) pendingFor(namespace, name string) (*pendingClaim, bool) {
+	v, ok := s.pending.Load(namespace + "/" + name)
+	if !ok {
+		return nil, false
+	}
+	pc := v.(*pendingClaim)
+	if s.now().Sub(pc.at) > pendingTTL {
+		s.pending.Delete(namespace + "/" + name)
+		return nil, false
+	}
+	return pc, true
+}
+
+// reconcilePending evicts pending entries this inventory confirms, so a sandbox
+// is served from real node state as soon as its node publishes it.
+func (s *scatterGatherStore) reconcilePending(inv *NodeInventory) {
+	for i := range inv.Entries {
+		ns, name, _ := parseClaimRef(inv.Entries[i].Name)
+		if name != "" {
+			s.forgetClaim(ns, name)
+		}
+	}
+}
+
+// unconfirmed returns the pending claims not present in seen, as Sandboxes
+// filtered like any other. Callers pass the names their inventory fan-out
+// already produced.
+func (s *scatterGatherStore) unconfirmed(seen map[string]struct{}, namespace string, labelSel labels.Selector, fieldSel fields.Selector) []sandboxv1beta1.Sandbox {
+	var out []sandboxv1beta1.Sandbox
+	now := s.now()
+	s.pending.Range(func(k, v any) bool {
+		key := k.(string)
+		pc := v.(*pendingClaim)
+		if now.Sub(pc.at) > pendingTTL {
+			s.pending.Delete(key)
+			return true
+		}
+		if _, dup := seen[key]; dup {
+			return true
+		}
+		sb := s.applyOverlay(entryToSandbox(pc.node, pc.entry))
+		if namespace != "" && sb.Namespace != namespace {
+			return true
+		}
+		if !labelSel.Matches(labels.Set(sb.Labels)) || !fieldSel.Matches(sandboxFields(sb)) {
+			return true
+		}
+		out = append(out, *sb)
+		return true
+	})
+	return out
+}
+
+// now is the store's clock, indirected so tests can age pending entries.
+func (s *scatterGatherStore) now() time.Time {
+	if s.clock != nil {
+		return s.clock()
+	}
+	return time.Now()
 }
 
 // pickWarmNode scans node inventories and returns the node (and its sandboxd
@@ -496,13 +745,30 @@ func (s *scatterGatherStore) runWatch(ctx context.Context, opts ListOptions, w *
 	}
 
 	// Initial synchronization: an Added for every currently-visible sandbox.
+	initialRV := "1"
 	if list, err := s.List(ctx, opts); err != nil {
 		s.log.Error(err, "initial watch list failed")
 	} else {
+		initialRV = list.ResourceVersion
 		for i := range list.Items {
 			sb := list.Items[i].DeepCopy()
 			known[objKey(sb)] = sb
 			if !emit(watch.Added, sb) {
+				return
+			}
+		}
+		// Close the initial burst the way a streaming list (WatchList) requires:
+		// a bookmark annotated "k8s.io/initial-events-end". The reflector treats
+		// that annotation as "the collection is now fully delivered" — without it
+		// it waits indefinitely, the informer never reports synced, and since
+		// controller-runtime blocks on cache sync before leader election, every
+		// controller in the process stays unstarted while the pod looks healthy.
+		if opts.SendInitialEvents {
+			end := &sandboxv1beta1.Sandbox{}
+			end.SetGroupVersionKind(sandboxv1beta1.GroupVersion.WithKind("Sandbox"))
+			end.SetResourceVersion(initialRV)
+			end.SetAnnotations(map[string]string{metav1.InitialEventsAnnotationKey: "true"})
+			if !emit(watch.Bookmark, end) {
 				return
 			}
 		}
@@ -547,15 +813,51 @@ func (s *scatterGatherStore) runWatch(ctx context.Context, opts ListOptions, w *
 				}
 			}
 			known = cur
+
+			// Bookmark every tick. controller-runtime asks for bookmarks and uses
+			// them to advance its cursor; without them the client resumes from the
+			// initial list version forever, the apiserver eventually rejects it as
+			// expired, and the informer never finishes syncing — which silently
+			// keeps every controller that watches Sandbox from ever starting.
+			if opts.AllowWatchBookmarks {
+				mark := &sandboxv1beta1.Sandbox{}
+				mark.SetGroupVersionKind(sandboxv1beta1.GroupVersion.WithKind("Sandbox"))
+				rv := s.collectionResourceVersion(ctx, nodesOf(list))
+				if rv == "1" {
+					rv = initialRV
+				}
+				mark.SetResourceVersion(rv)
+				if !emit(watch.Bookmark, mark) {
+					return
+				}
+			}
 		}
 	}
+}
+
+// nodesOf reports the nodes a synthesized list came from, so a bookmark quotes
+// the same inventory generation the events did.
+func nodesOf(list *sandboxv1beta1.SandboxList) []string {
+	seen := map[string]struct{}{}
+	out := make([]string, 0, 8)
+	for i := range list.Items {
+		n := list.Items[i].Status.NodeName
+		if n == "" {
+			continue
+		}
+		if _, ok := seen[n]; !ok {
+			seen[n] = struct{}{}
+			out = append(out, n)
+		}
+	}
+	return out
 }
 
 // materialize turns one node's inventory entries into filtered Sandboxes.
 func (s *scatterGatherStore) materialize(inv *NodeInventory, namespace string, labelSel labels.Selector, fieldSel fields.Selector) []sandboxv1beta1.Sandbox {
 	out := make([]sandboxv1beta1.Sandbox, 0, len(inv.Entries))
 	for i := range inv.Entries {
-		sb := entryToSandbox(inv.Node, inv.Entries[i])
+		sb := s.applyOverlay(entryToSandbox(inv.Node, inv.Entries[i]))
 		if namespace != "" && sb.Namespace != namespace {
 			continue
 		}
@@ -588,14 +890,19 @@ func parseSelectors(opts ListOptions) (labels.Selector, fields.Selector, error) 
 // The entry name is the sandbox's "<namespace>/<name>"; an unqualified name
 // lands in the default namespace.
 func entryToSandbox(node string, e InventoryEntry) *sandboxv1beta1.Sandbox {
-	ns, name := splitNamespacedName(e.Name)
+	// A node names the entry after the claim_ref it was handed, uid suffix and
+	// all, so the same parser has to read both fields — otherwise the sandbox is
+	// served under a name no client ever asked for.
+	ns, name, _ := parseClaimRef(e.Name)
 	sb := &sandboxv1beta1.Sandbox{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace:       ns,
 			Name:            name,
 			Labels:          synthLabels(node, e),
 			Annotations:     synthAnnotations(e),
+			UID:             sandboxUID(ns, name, e),
 			ResourceVersion: resourceVersionFor(ns, name, e),
+			OwnerReferences: synthOwnerRefs(ns, e),
 		},
 		Status: sandboxv1beta1.SandboxStatus{
 			NodeName: node,
@@ -611,16 +918,113 @@ func entryToSandbox(node string, e InventoryEntry) *sandboxv1beta1.Sandbox {
 	return sb
 }
 
+// synthOwnerRefs restores the SandboxClaim controller reference a claim-created
+// Sandbox would carry if it were a stored object. Nothing here is stored — the
+// Sandbox is synthesized per read — so an ownerReference has no place to live
+// except the claim reference the node already records. Without it
+// metav1.IsControlledBy is false for every synthesized Sandbox, and the upstream
+// SandboxClaim controller rejects the very sandbox it just created with
+// "sandbox X is not controlled by claim X", retrying until the caller times out.
+//
+// Only a same-namespace claimRef produces a reference: ownerReferences are
+// namespace-local, so a cross-namespace claimRef must not be forged into one.
+func synthOwnerRefs(ns string, e InventoryEntry) []metav1.OwnerReference {
+	claimNS, claimName, uid := parseClaimRef(e.ClaimRef)
+	// A reference is only emitted when the real claim UID is known. Never forge
+	// one: IsControlledBy compares UIDs and nothing else, so a made-up UID fails
+	// the check it was meant to satisfy, and Kubernetes' garbage collector reads
+	// an ownerReference whose UID does not resolve as an owner that has been
+	// deleted — and deletes the live sandbox under it.
+	if claimName == "" || uid == "" {
+		return nil
+	}
+	// ownerReferences are namespace-local, so a cross-namespace claimRef must not
+	// become one.
+	if claimNS != ns {
+		return nil
+	}
+	controller, blockDelete := true, true
+	return []metav1.OwnerReference{{
+		APIVersion:         extv1beta1.GroupVersion.String(),
+		Kind:               "SandboxClaim",
+		Name:               claimName,
+		UID:                types.UID(uid),
+		Controller:         &controller,
+		BlockOwnerDeletion: &blockDelete,
+	}}
+}
+
+// sandboxUID derives the object's own UID from the sandboxd claim id, which the
+// node assigns once and republishes unchanged for the life of the microVM.
+//
+// A synthesized object still needs one. Kubernetes treats a missing metadata.uid
+// as "this object was never persisted": the PATCH handler checks it before
+// anything else and answers 404 for an object it just served over GET, so every
+// controller that patches — which is every controller — fails against a
+// collection without UIDs. Unlike an ownerReference UID this one refers to
+// nothing else, so deriving it is safe as long as it is stable.
+func sandboxUID(ns, name string, e InventoryEntry) types.UID {
+	seed := e.ID
+	if seed == "" {
+		seed = ns + "/" + name
+	}
+	sum := sha256.Sum256([]byte("cocoon-sandbox-uid|" + seed))
+	// Shaped as a RFC 4122 version 4 UUID so it is indistinguishable from one a
+	// real apiserver would have assigned; the bytes are a digest, not randomness.
+	sum[6] = sum[6]&0x0f | 0x40
+	sum[8] = sum[8]&0x3f | 0x80
+	return types.UID(fmt.Sprintf("%x-%x-%x-%x-%x", sum[0:4], sum[4:6], sum[6:8], sum[8:10], sum[10:16]))
+}
+
+// claimRefUIDSep separates the claim's namespaced name from its UID inside the
+// single free-form claim_ref string a node echoes back on every inventory
+// publish. The UID has to travel with the claim because ownership is checked by
+// UID alone and the node is the only thing that remembers a sandbox across
+// apiserver restarts.
+//
+// A node also names the inventory entry after the claim_ref it was given, so
+// both InventoryEntry.Name and InventoryEntry.ClaimRef carry the suffix and both
+// must be read with parseClaimRef.
+const claimRefUIDSep = "#"
+
+// formatClaimRef builds the claim_ref handed to sandboxd. Callers with no
+// claim (an unowned warm sandbox, or an e2b-created one) pass an empty uid.
+func formatClaimRef(namespace, name, uid string) string {
+	ref := namespace + "/" + name
+	if uid == "" {
+		return ref
+	}
+	return ref + claimRefUIDSep + uid
+}
+
+// parseClaimRef splits a claim_ref into namespace, name and — when the claim
+// that created it recorded one — the owning claim's UID.
+func parseClaimRef(ref string) (namespace, name, uid string) {
+	if ref == "" {
+		return "", "", ""
+	}
+	if i := strings.Index(ref, claimRefUIDSep); i >= 0 {
+		ref, uid = ref[:i], ref[i+len(claimRefUIDSep):]
+	}
+	namespace, name = splitNamespacedName(ref)
+	return namespace, name, uid
+}
+
 func synthLabels(node string, e InventoryEntry) map[string]string {
-	l := map[string]string{NodeLabel: node}
+	l := map[string]string{
+		NodeLabel: node,
+		// Every sandbox here is handed over from a pool of already-booted microVMs;
+		// there is no cold path. Reporting it is not cosmetic: the claim controller
+		// patches this label onto any sandbox that lacks it, and a synthesized
+		// collection has nothing to patch — the write fails and the claim never
+		// goes ready. Serving the value the store already knows removes the write.
+		sandboxv1beta1.SandboxLaunchTypeLabel: sandboxv1beta1.SandboxLaunchTypeWarm,
+	}
 	if e.Phase != "" {
 		l[PhaseLabel] = e.Phase
 	}
-	if e.ClaimRef != "" {
-		_, claim := splitNamespacedName(e.ClaimRef)
-		if claim != "" {
-			l[ClaimLabel] = claim
-		}
+	if _, claim, _ := parseClaimRef(e.ClaimRef); claim != "" {
+		l[ClaimLabel] = claim
 	}
 	return l
 }

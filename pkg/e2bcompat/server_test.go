@@ -65,7 +65,11 @@ func (f *fakeStore) Watch(context.Context, scale.ListOptions) (watch.Interface, 
 	return nil, nil
 }
 
-func (f *fakeStore) Claim(_ context.Context, ns, name string, pool scale.PoolKey) (scale.Assignment, error) {
+func (f *fakeStore) Overlay(context.Context, string, string, scale.SandboxOverlay) error {
+	return nil
+}
+
+func (f *fakeStore) Claim(_ context.Context, ns, name string, pool scale.PoolKey, _ ...scale.ClaimOption) (scale.Assignment, error) {
 	f.claimNS, f.claimName, f.claimPool = ns, name, pool
 	if f.claimErr != nil {
 		return scale.Assignment{}, f.claimErr

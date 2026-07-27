@@ -18,6 +18,7 @@ import (
 	openapicommon "k8s.io/kube-openapi/pkg/common"
 	"k8s.io/kube-openapi/pkg/validation/spec"
 
+	sandboxv1alpha1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1alpha1"
 	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
 )
 
@@ -26,17 +27,28 @@ import (
 // namer resolves the sandboxes resource to these definitions.
 const sandboxDefPrefix = "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1."
 
+// alphaDefPrefix keys the same models under the v1alpha1 package, the version
+// the upstream clients speak.
+const alphaDefPrefix = "github.com/doge-rgb/cocoon-sandbox-operator/api/v1alpha1."
+
 // gvkExtension is the x-kubernetes-group-version-kind marker the managed-fields
 // TypeConverter (managedfields/internal.indexModels) reads to map a GVK to its
 // model. WITHOUT it, ObjectToTyped(sandbox) returns NoCorrespondingTypeError,
 // which the create handler swallows as a "[SHOULD NOT HAPPEN] failed to update
 // managedFields" error on every write. This is the whole reason this file exists.
 func gvkExtension(kind string) spec.Extensions {
+	return gvkExtensionFor(sandboxv1beta1.GroupVersion.Version, kind)
+}
+
+// gvkExtensionFor is gvkExtension for a specific served version. Both v1alpha1
+// and v1beta1 are served, and a model whose marker names the wrong version is
+// as good as missing.
+func gvkExtensionFor(version, kind string) spec.Extensions {
 	return spec.Extensions{
 		"x-kubernetes-group-version-kind": []interface{}{
 			map[string]interface{}{
 				"group":   sandboxv1beta1.GroupVersion.Group,
-				"version": sandboxv1beta1.GroupVersion.Version,
+				"version": version,
 				"kind":    kind,
 			},
 		},
@@ -108,6 +120,24 @@ func sandboxOpenAPIDefinitions(ref openapicommon.ReferenceCallback) map[string]o
 		sandboxDefPrefix + "Sandbox":     sandbox,
 		sandboxDefPrefix + "SandboxList": list,
 	}
+	// v1alpha1 is served from the same storage, and InstallAPIGroup aborts the
+	// whole group when any served version lacks a model. The shapes are the same
+	// coarse ones; only the version marker differs.
+	alphaSandbox, alphaList := sandbox, list
+	alphaSandbox.Schema.Extensions = gvkExtensionFor(sandboxv1alpha1.GroupVersion.Version, "Sandbox")
+	alphaList.Schema.Extensions = gvkExtensionFor(sandboxv1alpha1.GroupVersion.Version, "SandboxList")
+	alphaList.Dependencies = []string{alphaDefPrefix + "Sandbox"}
+	alphaList.Schema.Properties = map[string]spec.Schema{
+		"kind":       stringSchema(),
+		"apiVersion": stringSchema(),
+		"metadata":   preserveUnknownObject(),
+		"items": {SchemaProps: spec.SchemaProps{
+			Type:  spec.StringOrArray{"array"},
+			Items: &spec.SchemaOrArray{Schema: &spec.Schema{SchemaProps: spec.SchemaProps{Ref: ref(alphaDefPrefix + "Sandbox")}}},
+		}},
+	}
+	defs[alphaDefPrefix+"Sandbox"] = alphaSandbox
+	defs[alphaDefPrefix+"SandboxList"] = alphaList
 	// The action subresources (sandboxes/pause, /resume, /fork, /snapshot)
 	// exchange their own request and reply types. Every type reachable from a
 	// served resource needs a model here or InstallAPIGroup fails outright with

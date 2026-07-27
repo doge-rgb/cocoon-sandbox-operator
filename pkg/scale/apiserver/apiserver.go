@@ -24,6 +24,7 @@ import (
 	basecompatibility "k8s.io/component-base/compatibility"
 	openapicommon "k8s.io/kube-openapi/pkg/common"
 
+	sandboxv1alpha1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1alpha1"
 	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale"
 )
@@ -58,6 +59,10 @@ func InstallSandboxAPI(server *genericapiserver.GenericAPIServer, store scale.Sa
 		"sandboxes/fork":     NewSandboxForkREST(store),
 		"sandboxes/snapshot": NewSandboxSnapshotREST(store),
 	}
+	// The same storage serves v1alpha1; the scheme converts on the way out. The
+	// upstream clients — including the official Go SDK — are v1alpha1.
+	apiGroupInfo.VersionedResourcesStorageMap[sandboxv1alpha1.GroupVersion.Version] =
+		apiGroupInfo.VersionedResourcesStorageMap[sandboxv1beta1.GroupVersion.Version]
 	if err := server.InstallAPIGroup(&apiGroupInfo); err != nil {
 		return fmt.Errorf("apiserver: install sandboxes API group: %w", err)
 	}

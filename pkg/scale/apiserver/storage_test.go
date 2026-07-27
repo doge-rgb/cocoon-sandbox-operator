@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/watch"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apiserver/pkg/registry/rest"
 
 	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale"
@@ -39,6 +40,7 @@ type fakeStore struct {
 	releaseNode string
 	releaseID   string
 	releaseErr  error
+	overlay     scale.SandboxOverlay
 }
 
 func (f *fakeStore) List(context.Context, scale.ListOptions) (*sandboxv1beta1.SandboxList, error) {
@@ -53,7 +55,12 @@ func (f *fakeStore) Watch(context.Context, scale.ListOptions) (watch.Interface, 
 	return watch.NewFake(), nil
 }
 
-func (f *fakeStore) Claim(context.Context, string, string, scale.PoolKey) (scale.Assignment, error) {
+func (f *fakeStore) Overlay(_ context.Context, _, _ string, ov scale.SandboxOverlay) error {
+	f.overlay = ov
+	return nil
+}
+
+func (f *fakeStore) Claim(context.Context, string, string, scale.PoolKey, ...scale.ClaimOption) (scale.Assignment, error) {
 	return scale.Assignment{}, nil
 }
 
@@ -128,4 +135,31 @@ func (f *fakeStore) Promote(context.Context, string, string, string) (scale.Pool
 }
 func (f *fakeStore) Stats(context.Context, string, string) (scale.SandboxStats, error) {
 	return scale.SandboxStats{}, nil
+}
+
+// TestUpdateRecordsClientWritesAsAnOverlay pins the write contract of a
+// synthesized collection. Controllers write to the objects they manage and then
+// require their own writes to be readable — the SandboxClaim controller stamps a
+// template hash onto every sandbox and re-patches until it sees it — so a
+// collection that drops writes makes them retry forever. Only the difference
+// from the synthesized object is recorded, so a derived value the client merely
+// echoed back keeps tracking the node instead of freezing.
+func TestUpdateRecordsClientWritesAsAnOverlay(t *testing.T) {
+	sb := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{
+		Namespace: "ns", Name: "s1",
+		Labels: map[string]string{sandboxv1beta1.SandboxLaunchTypeLabel: sandboxv1beta1.SandboxLaunchTypeWarm}}}
+	store := &fakeStore{getSandbox: sb}
+	r := NewSandboxREST(store).(*sandboxREST)
+	ctx := deleteCtx("ns")
+
+	written := sb.DeepCopy()
+	written.Labels["template-hash"] = "abc123"
+	got, created, err := r.Update(ctx, "s1", rest.DefaultUpdatedObjectInfo(written), nil, nil, false, &metav1.UpdateOptions{})
+	require.NoError(t, err, "a controller's write must be accepted, not rejected")
+	assert.False(t, created)
+	assert.Equal(t, "abc123", got.(*sandboxv1beta1.Sandbox).Labels["template-hash"])
+
+	assert.Equal(t, map[string]string{"template-hash": "abc123"}, store.overlay.Labels,
+		"only the changed key is recorded; the echoed-back launch type must keep tracking node state")
+	assert.Nil(t, store.overlay.Spec, "an unchanged spec must not be pinned")
 }

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net"
 
+	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 	metainternalversion "k8s.io/apimachinery/pkg/apis/meta/internalversion"
@@ -72,6 +73,8 @@ var (
 	_ rest.Watcher              = (*sandboxREST)(nil)
 	_ rest.Creater              = (*sandboxREST)(nil) //nolint:misspell // rest.Creater is the upstream Kubernetes interface name.
 	_ rest.GracefulDeleter      = (*sandboxREST)(nil)
+	_ rest.Updater              = (*sandboxREST)(nil)
+	_ rest.Patcher              = (*sandboxREST)(nil)
 	_ rest.TableConvertor       = (*sandboxREST)(nil)
 	_ rest.SingularNameProvider = (*sandboxREST)(nil)
 )
@@ -147,8 +150,20 @@ func (r *sandboxREST) Create(ctx context.Context, obj runtime.Object, createVali
 	}
 
 	pool := poolKeyForSandbox(sb)
-	assignment, err := r.store.Claim(ctx, namespace, name, pool)
+	// Carry the creating claim's UID through to the node. Ownership is checked by
+	// UID alone, and the submitted object is the only place the real one appears —
+	// the synthesized collection has no other way to learn it.
+	var claimOpts []scale.ClaimOption
+	if owner := metav1.GetControllerOf(sb); owner != nil && owner.Kind == "SandboxClaim" {
+		claimOpts = append(claimOpts, scale.WithOwnerUID(string(owner.UID)))
+	}
+	assignment, err := r.store.Claim(ctx, namespace, name, pool, claimOpts...)
 	if err != nil {
+		if scale.IsClaimExists(err) {
+			// A controller re-creating after a read it could not see must get the
+			// standard 409, not a second microVM.
+			return nil, apierrors.NewAlreadyExists(sandboxv1beta1.Resource("sandboxes"), name)
+		}
 		if scale.IsNoWarmCapacity(err) {
 			// Retryable: warm capacity refills asynchronously (the node's sandboxd
 			// pool), so tell the client to retry rather than surfacing a 500.
@@ -159,6 +174,87 @@ func (r *sandboxREST) Create(ctx context.Context, obj runtime.Object, createVali
 		return nil, apierrors.NewInternalError(fmt.Errorf("claim sandbox %s/%s: %w", namespace, name, err))
 	}
 	return synthesizeClaimedSandbox(namespace, name, sb, assignment), nil
+}
+
+// Update serves the write half of the standard controller shape against a
+// collection that has no stored objects to write to. Every field of a Sandbox
+// here is derived from live node state, so there is nothing a client can set
+// that would survive — but refusing outright breaks callers that only re-assert
+// what the store already reports, which is what a controller does when it
+// patches a label onto an object that already carries it.
+//
+// So the write is kept, as an overlay the store replays onto every later read of
+// that sandbox: the client sees what it wrote, while status and phase keep
+// tracking the node. Only the difference from the synthesized object is
+// recorded, so echoing back a derived value does not freeze it. The overlay is
+// process-local — it is not a stored object and never becomes one — which costs
+// at most one re-write from the controller that made it if the apiserver
+// restarts.
+func (r *sandboxREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, _ *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	namespace := genericapirequest.NamespaceValue(ctx)
+	current, err := r.store.Get(ctx, namespace, name)
+	if err != nil {
+		return nil, false, err
+	}
+	updated, err := objInfo.UpdatedObject(ctx, current.DeepCopyObject())
+	if err != nil {
+		return nil, false, err
+	}
+	sb, ok := updated.(*sandboxv1beta1.Sandbox)
+	if !ok {
+		return nil, false, apierrors.NewBadRequest(fmt.Sprintf("expected a Sandbox object, got %T", updated))
+	}
+	if updateValidation != nil {
+		if err := updateValidation(ctx, sb, current); err != nil {
+			return nil, false, err
+		}
+	}
+	// Record what the client owns so the next read returns it. Status is not
+	// overlaid: it is the node's report, and a client that "sets" it would only be
+	// told a story until the next publish.
+	if err := r.store.Overlay(ctx, namespace, name, scale.SandboxOverlay{
+		Labels:      diffMap(current.Labels, sb.Labels),
+		Annotations: diffMap(current.Annotations, sb.Annotations),
+		Spec:        changedSpec(current, sb),
+	}); err != nil {
+		return nil, false, apierrors.NewInternalError(fmt.Errorf("record sandbox %s/%s metadata: %w", namespace, name, err))
+	}
+	sb.Status = current.Status
+	sb.ResourceVersion = current.ResourceVersion
+	return sb, false, nil
+}
+
+// diffMap returns the keys updated changes relative to current, with a removed
+// key recorded as an empty value. Only the difference is kept, so a synthesized
+// key the client merely echoed back keeps tracking live node state instead of
+// freezing at the value it had when the client wrote.
+func diffMap(current, updated map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range updated {
+		if cur, ok := current[k]; !ok || cur != v {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[k] = v
+		}
+	}
+	for k := range current {
+		if _, ok := updated[k]; !ok {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[k] = ""
+		}
+	}
+	return out
+}
+
+// changedSpec returns the submitted spec when it differs from what is served.
+func changedSpec(current, updated *sandboxv1beta1.Sandbox) *sandboxv1beta1.SandboxSpec {
+	if apiequality.Semantic.DeepEqual(current.Spec, updated.Spec) {
+		return nil
+	}
+	return updated.Spec.DeepCopy()
 }
 
 // Delete is the L3 release path. It resolves the sandbox from live node inventory
@@ -216,6 +312,8 @@ func toScaleListOptions(ctx context.Context, options *metainternalversion.ListOp
 		if options.FieldSelector != nil {
 			o.FieldSelector = options.FieldSelector.String()
 		}
+		o.AllowWatchBookmarks = options.AllowWatchBookmarks
+		o.SendInitialEvents = options.SendInitialEvents != nil && *options.SendInitialEvents
 	}
 	return o
 }

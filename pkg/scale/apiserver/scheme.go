@@ -22,11 +22,13 @@ package apiserver
 
 import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/conversion"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 
+	sandboxv1alpha1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1alpha1"
 	sandboxv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/api/v1beta1"
 )
 
@@ -58,10 +60,65 @@ func init() {
 		&sandboxv1beta1.SandboxSnapshotOptions{},
 		&sandboxv1beta1.SandboxSnapshotResult{},
 	)
+	// v1alpha1 is served alongside v1beta1 because that is the version the
+	// upstream agent-sandbox clients speak — the official Go SDK builds an
+	// AgentsV1alpha1 client and lists sandboxes through it, so a group that
+	// serves only v1beta1 answers every SDK call with a 404 for the group.
+	utilruntime.Must(sandboxv1alpha1.AddToScheme(Scheme))
+	utilruntime.Must(registerAlphaConversions(Scheme))
+	metav1.AddToGroupVersion(Scheme, sandboxv1alpha1.GroupVersion)
 	metav1.AddToGroupVersion(Scheme, sandboxv1beta1.GroupVersion)
 	// The common request/response meta types (ListOptions, GetOptions, Status,
 	// WatchEvent, ...) live at the "v1" options version the request pipeline
 	// decodes against (APIGroupInfo.OptionsExternalVersion defaults to v1).
 	metav1.AddToGroupVersion(Scheme, schema.GroupVersion{Version: "v1"})
-	utilruntime.Must(Scheme.SetVersionPriority(sandboxv1beta1.GroupVersion))
+	// v1beta1 first: it is the storage-shaped version the store speaks and the
+	// one the internal type is identical to.
+	utilruntime.Must(Scheme.SetVersionPriority(sandboxv1beta1.GroupVersion, sandboxv1alpha1.GroupVersion))
+}
+
+// registerAlphaConversions teaches the scheme to move between v1alpha1 and the
+// internal (v1beta1-shaped) types. The per-object conversions already exist as
+// the controller-runtime hub methods the CRD conversion webhook uses; these
+// adapters just expose them to the apiserver's request pipeline, which converts
+// through the scheme rather than through conversion.Convertible.
+func registerAlphaConversions(scheme *runtime.Scheme) error {
+	if err := scheme.AddConversionFunc((*sandboxv1alpha1.Sandbox)(nil), (*sandboxv1beta1.Sandbox)(nil),
+		func(a, b any, _ conversion.Scope) error {
+			return a.(*sandboxv1alpha1.Sandbox).ConvertTo(b.(*sandboxv1beta1.Sandbox))
+		}); err != nil {
+		return err
+	}
+	if err := scheme.AddConversionFunc((*sandboxv1beta1.Sandbox)(nil), (*sandboxv1alpha1.Sandbox)(nil),
+		func(a, b any, _ conversion.Scope) error {
+			return b.(*sandboxv1alpha1.Sandbox).ConvertFrom(a.(*sandboxv1beta1.Sandbox))
+		}); err != nil {
+		return err
+	}
+	if err := scheme.AddConversionFunc((*sandboxv1alpha1.SandboxList)(nil), (*sandboxv1beta1.SandboxList)(nil),
+		func(a, b any, _ conversion.Scope) error {
+			src, dst := a.(*sandboxv1alpha1.SandboxList), b.(*sandboxv1beta1.SandboxList)
+			dst.ListMeta = src.ListMeta
+			dst.Items = make([]sandboxv1beta1.Sandbox, len(src.Items))
+			for i := range src.Items {
+				if err := src.Items[i].ConvertTo(&dst.Items[i]); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+		return err
+	}
+	return scheme.AddConversionFunc((*sandboxv1beta1.SandboxList)(nil), (*sandboxv1alpha1.SandboxList)(nil),
+		func(a, b any, _ conversion.Scope) error {
+			src, dst := a.(*sandboxv1beta1.SandboxList), b.(*sandboxv1alpha1.SandboxList)
+			dst.ListMeta = src.ListMeta
+			dst.Items = make([]sandboxv1alpha1.Sandbox, len(src.Items))
+			for i := range src.Items {
+				if err := dst.Items[i].ConvertFrom(&src.Items[i]); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
 }

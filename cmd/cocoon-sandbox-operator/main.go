@@ -79,6 +79,7 @@ func main() {
 	var sandboxWarmPoolMaxBatchSize int
 	var enableWarmPoolEviction bool
 	var sandboxWarmPoolDisableCRManagement bool
+	var disableSandboxPodManagement bool
 	var webhookOnly bool
 	var printVersion bool
 	var webhookPort int
@@ -123,6 +124,10 @@ func main() {
 	flag.IntVar(&sandboxTemplateConcurrentWorkers, "sandbox-template-concurrent-workers", 1, "Max concurrent reconciles for the SandboxTemplate controller")
 	flag.IntVar(&sandboxWarmPoolMaxBatchSize, "sandbox-warm-pool-max-batch-size", 300, "Max batch size for parallel sandbox creation and deletion in SandboxWarmPool controller. Default is 300.")
 	flag.BoolVar(&enableWarmPoolEviction, "enable-warm-pool-eviction", true, "Mark pods created by a warm pool as ready-to-evict by default.")
+	flag.BoolVar(&disableSandboxPodManagement, "disable-sandbox-pod-management", false,
+		"Do not run the core Sandbox reconciler. Set this when Sandboxes are served by the "+
+			"aggregated apiserver over node-local microVMs: there is no Pod to materialize, "+
+			"and reconciling one fights the aggregated path.")
 	flag.BoolVar(&sandboxWarmPoolDisableCRManagement, "sandbox-warm-pool-disable-cr-management", false,
 		"Disable per-CR Sandbox create/delete in the SandboxWarmPool controller (status-only). "+
 			"Use with the L3 writable-aggregation design, where warm capacity is driven per-node by sandboxd "+
@@ -338,7 +343,9 @@ func main() {
 		// Register the custom Sandbox metric collector globally.
 		asmetrics.RegisterSandboxCollector(mgr.GetClient(), mgr.GetLogger().WithName("sandbox-collector"))
 
-		if err = (&controllers.SandboxReconciler{
+		if disableSandboxPodManagement {
+			setupLog.Info("disable-sandbox-pod-management: not running the core Sandbox reconciler")
+		} else if err = (&controllers.SandboxReconciler{
 			Client:        mgr.GetClient(),
 			Scheme:        mgr.GetScheme(),
 			Tracer:        instrumenter,

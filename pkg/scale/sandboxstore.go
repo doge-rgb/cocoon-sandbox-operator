@@ -30,6 +30,18 @@ type ListOptions struct {
 	Namespace     string
 	LabelSelector string
 	FieldSelector string
+	// AllowWatchBookmarks mirrors the client's request for bookmark events on a
+	// watch. Honoring it is what lets an informer advance its cursor and reach
+	// synced against this synthesized collection.
+	AllowWatchBookmarks bool
+	// SendInitialEvents mirrors the streaming-list request modern client-go makes
+	// by default (WatchList): replay the current collection as Added events, then
+	// close the initial burst with a bookmark carrying the
+	// "k8s.io/initial-events-end" annotation. A server that never sends that
+	// bookmark leaves the reflector waiting forever, so the informer never syncs
+	// and — because controller-runtime waits for cache sync before it even starts
+	// leader election — no controller in the process ever starts.
+	SendInitialEvents bool
 }
 
 // PoolKey identifies a warm pool by the claim axes the aggregated Create path
@@ -67,7 +79,17 @@ type SandboxStore interface {
 	// synchronous node-local ownership transfer via the owning node's sandboxd.
 	// When no node has a warm microVM for the pool it returns an error for which
 	// IsNoWarmCapacity is true, so the caller can surface a retryable 503.
-	Claim(ctx context.Context, namespace, name string, pool PoolKey) (Assignment, error)
+	Claim(ctx context.Context, namespace, name string, pool PoolKey, opts ...ClaimOption) (Assignment, error)
+
+	// Overlay records the client-owned metadata a caller wrote onto a sandbox and
+	// serves it back on every subsequent read. Sandboxes are synthesized from live
+	// node state, so there is no stored object to update — but controllers write
+	// to the objects they manage and then require their own writes to be visible,
+	// and a collection that silently drops them makes those controllers retry
+	// forever. Node state stays authoritative for status; the overlay covers only
+	// what the client owns. It is process-local by design: losing it on restart
+	// costs one re-write from the controller that made it.
+	Overlay(ctx context.Context, namespace, name string, ov SandboxOverlay) error
 	// Release returns the claimed microVM id to its owning node's pool. It is
 	// owner-authorized teardown only (the Sandbox resource itself being deleted);
 	// it never destroys a VM on pod state alone. The node's sandboxd address is
@@ -143,6 +165,15 @@ type SandboxStats struct {
 
 // InventoryEntry is one live sandbox as summarized by its owning node.
 type InventoryEntry = extv1beta1.InventoryEntry
+
+// SandboxOverlay is the client-owned part of a Sandbox: what a caller wrote and
+// expects to read back. A key mapped to the empty string is a tombstone — the
+// client removed a synthesized key.
+type SandboxOverlay struct {
+	Labels      map[string]string
+	Annotations map[string]string
+	Spec        *sandboxv1beta1.SandboxSpec
+}
 
 // NodeInventory is the single O(nodes) etcd object per node: the durable summary
 // of that node's live sandboxes, server-side-applied on a slow cadence. The
