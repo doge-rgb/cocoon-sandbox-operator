@@ -24,7 +24,7 @@
 //  6. Re-check the prod-desktop count is unchanged.
 //
 //     Run: KUBECONFIG=<vke-my> go run -tags e2ebench ./test/e2ebench \
-//     -pool 100 -node cocoon-bd26 -out e2e-fullstack.json
+//     -pool 100 -node <sandbox-node> -out e2e-fullstack.json
 package main
 
 import (
@@ -53,7 +53,7 @@ import (
 var (
 	ns          = flag.String("ns", "g0131-e2e", "namespace for the run")
 	poolSize    = flag.Int("pool", 100, "warm pool desired replicas (= claims fired)")
-	node        = flag.String("node", "cocoon-bd26", "vk-cocoon node to pin the run to")
+	node        = flag.String("node", "", "vk-cocoon node to pin the run to (required)")
 	prodNS      = flag.String("prod-ns", "cloud-desktop", "namespace whose pods on the node must stay intact")
 	sbImage     = flag.String("image", "ghcr.io/cocoonstack/sandbox/rt:24.04", "sandbox VM image")
 	fillWait    = flag.Int("fill-timeout", 600, "seconds to wait for the pool to fill")
@@ -82,6 +82,13 @@ func must(err error) {
 
 func main() {
 	flag.Parse()
+	// The node is deliberately not defaulted: this run pins real sandboxes onto
+	// whatever it names, so it has to be a deliberate choice by the operator, not
+	// a hostname that happened to be typed into the source.
+	if *node == "" {
+		fmt.Fprintln(os.Stderr, "-node is required: name the vk-cocoon node to pin this run to")
+		os.Exit(2)
+	}
 	must(clientgoscheme.AddToScheme(scheme))
 	must(sandboxv1beta1.AddToScheme(scheme))
 	must(extv1beta1.AddToScheme(scheme))

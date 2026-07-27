@@ -13,7 +13,7 @@
 // count changes, it aborts.
 //
 //	Run: KUBECONFIG=<vke-my> go run -tags scalestress ./test/scalestress \
-//	       -hosts cocoon-bd23,cocoon-bd24,cocoon-bd25,cocoon-bd26 \
+//	       -hosts <node-a>,<node-b>,<node-c>,<node-d> \
 //	       -steps 50,100,150,200 -out stress.json
 package main
 
@@ -45,7 +45,7 @@ import (
 
 var (
 	ns        = flag.String("ns", "g0131-stress", "namespace for the run")
-	hostsCSV  = flag.String("hosts", "cocoon-bd23,cocoon-bd24,cocoon-bd25,cocoon-bd26", "vk-cocoon nodes to spread across")
+	hostsCSV  = flag.String("hosts", "", "comma-separated vk-cocoon nodes to spread across (required)")
 	stepsCSV  = flag.String("steps", "50,100,150,200", "cumulative warm-pool sizes (kept <=200)")
 	prodNS    = flag.String("prod-ns", "cloud-desktop", "namespace whose pods on the target nodes must not change")
 	sbImage   = flag.String("image", "ghcr.io/cocoonstack/sandbox/rt:24.04", "sandbox VM image")
@@ -79,6 +79,12 @@ func must(err error) {
 
 func main() {
 	flag.Parse()
+	// Not defaulted on purpose: this run loads real nodes, so which ones must be
+	// stated by the caller rather than inherited from a hostname left in source.
+	if *hostsCSV == "" {
+		fmt.Fprintln(os.Stderr, "-hosts is required: comma-separated vk-cocoon nodes to spread across")
+		os.Exit(2)
+	}
 	must(clientgoscheme.AddToScheme(scheme))
 	must(sandboxv1beta1.AddToScheme(scheme))
 	must(extv1beta1.AddToScheme(scheme))

@@ -178,9 +178,9 @@ prints what it did, so the output doubles as acceptance evidence:
 ```
 === Kubernetes API ===
   create     Sandbox default/example-219526000
-  get        node=cocoon-bd25-sandboxd claimID=sb_77ace349e7cc1db6
-  snapshot   snapshotID=ck_92799687f14e8fea on node=cocoon-bd25-sandboxd
-  fork       child[0] sandboxID=sb_06d1b2438dcc1d1b node=cocoon-bd25-sandboxd
+  get        node=sandbox-node-01 claimID=sb_77ace349e7cc1db6
+  snapshot   snapshotID=ck_92799687f14e8fea on node=sandbox-node-01
+  fork       child[0] sandboxID=sb_06d1b2438dcc1d1b node=sandbox-node-01
   pause      took 315ms (proportional to guest memory)
   resume     took 109ms (mmap restore fast path)
 

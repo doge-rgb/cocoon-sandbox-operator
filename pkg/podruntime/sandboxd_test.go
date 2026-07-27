@@ -92,7 +92,7 @@ func TestMutateSandboxdRejectsPinnedNode(t *testing.T) {
 	m, _ := NewMutator(ModeSandboxd)
 	sandbox := &sandboxv1beta1.Sandbox{ObjectMeta: metav1.ObjectMeta{Name: "sb", Namespace: "ns"}}
 	pod := sandboxdPod("base:24.04")
-	pod.Spec.NodeName = "cocoon-bd1"
+	pod.Spec.NodeName = "sandbox-node-01"
 	if err := m.MutatePod(context.Background(), sandbox, pod); err == nil {
 		t.Fatal("expected error for pinned nodeName in sandboxd mode")
 	}
