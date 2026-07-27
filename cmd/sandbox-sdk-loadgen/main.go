@@ -41,6 +41,8 @@
 package main
 
 import (
+	"github.com/doge-rgb/cocoon-sandbox-operator/internal/baseimage"
+
 	"context"
 	"flag"
 	"fmt"
@@ -175,7 +177,7 @@ type options struct {
 func main() {
 	var o options
 	flag.StringVar(&o.namespace, "namespace", "sandbox-sdk-loadgen", "namespace to create Sandboxes in")
-	flag.StringVar(&o.image, "template", "ghcr.io/cocoonstack/sandbox/rt@sha256:c8cab53a1e1684e6c0c95a06855001b0535be2862b7d4f72658f9f0e784c8778", "container image; picks the warm pool (image=template, no resources=size small, no net annotation=none)")
+	flag.StringVar(&o.image, "template", baseimage.Default, "container image; picks the warm pool (image=template, no resources=size small, no net annotation=none)")
 	flag.StringVar(&o.namegen, "name-prefix", "sdklg", "generated Sandbox name prefix")
 	flag.IntVar(&o.concurrency, "concurrency", 1, "parallel create workers; with --cleanup this is also the max live claims")
 	flag.IntVar(&o.total, "total", 0, "REQUIRED: issue exactly this many creates, then stop (must be > 0; there is no unbounded mode)")

@@ -28,6 +28,8 @@
 package main
 
 import (
+	"github.com/doge-rgb/cocoon-sandbox-operator/internal/baseimage"
+
 	"context"
 	"encoding/json"
 	"flag"
@@ -55,7 +57,7 @@ var (
 	poolSize    = flag.Int("pool", 100, "warm pool desired replicas (= claims fired)")
 	node        = flag.String("node", "", "vk-cocoon node to pin the run to (required)")
 	prodNS      = flag.String("prod-ns", "cloud-desktop", "namespace whose pods on the node must stay intact")
-	sbImage     = flag.String("image", "ghcr.io/cocoonstack/sandbox/rt:24.04", "sandbox VM image")
+	sbImage     = flag.String("image", baseimage.Default, "sandbox VM image")
 	fillWait    = flag.Int("fill-timeout", 600, "seconds to wait for the pool to fill")
 	claimWait   = flag.Int("claim-timeout", 300, "seconds to wait for all claims to bind")
 	cleanupWait = flag.Int("cleanup-timeout", 240, "seconds to wait for zero-leak cleanup")

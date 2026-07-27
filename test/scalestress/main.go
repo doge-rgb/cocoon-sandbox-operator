@@ -18,6 +18,8 @@
 package main
 
 import (
+	"github.com/doge-rgb/cocoon-sandbox-operator/internal/baseimage"
+
 	"context"
 	"encoding/json"
 	"flag"
@@ -48,7 +50,7 @@ var (
 	hostsCSV  = flag.String("hosts", "", "comma-separated vk-cocoon nodes to spread across (required)")
 	stepsCSV  = flag.String("steps", "50,100,150,200", "cumulative warm-pool sizes (kept <=200)")
 	prodNS    = flag.String("prod-ns", "cloud-desktop", "namespace whose pods on the target nodes must not change")
-	sbImage   = flag.String("image", "ghcr.io/cocoonstack/sandbox/rt:24.04", "sandbox VM image")
+	sbImage   = flag.String("image", baseimage.Default, "sandbox VM image")
 	plName    = flag.String("priority-level", "vke-list-limit", "APF priority level that carries vk LIST")
 	listN     = flag.Int("list-samples", 15, "client LIST latency samples per step")
 	windowN   = flag.Int("window-samples", 10, "apiserver metric samples per step (peak detection)")

@@ -67,7 +67,7 @@ spec:
           args:
             - --replicas=100                # SandboxWarmPool size (pre-warmed sandboxes)
             - --namespace=sandboxd-test
-            - --template=ghcr.io/cocoonstack/sandbox/rt@sha256:c8cab53a1e1684e6c0c95a06855001b0535be2862b7d4f72658f9f0e784c8778
+            - --template=mindset-ap-southeast-1.cr.volces.com/g0031/sandbox-rt@sha256:4b4d2d626a998dbe683b08a86091f1b3d5b36cdccfc0b3bdab04dc114f5a1999
             - --created-by=loadgen
             - --metrics-addr=:9090
             - --claim-interval=1s           # gap between serial claims

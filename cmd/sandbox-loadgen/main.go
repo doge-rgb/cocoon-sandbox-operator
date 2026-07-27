@@ -11,6 +11,8 @@
 package main
 
 import (
+	"github.com/doge-rgb/cocoon-sandbox-operator/internal/baseimage"
+
 	"context"
 	"flag"
 	"fmt"
@@ -97,7 +99,7 @@ func main() {
 	o := options{}
 	flag.IntVar(&o.replicas, "replicas", 100, "SandboxWarmPool size (pre-warmed sandboxes)")
 	flag.StringVar(&o.namespace, "namespace", "sandboxd-test", "namespace")
-	flag.StringVar(&o.image, "template", "ghcr.io/cocoonstack/sandbox/rt@sha256:c8cab53a1e1684e6c0c95a06855001b0535be2862b7d4f72658f9f0e784c8778", "sandbox container image (digest ref)")
+	flag.StringVar(&o.image, "template", baseimage.Default, "sandbox container image (digest ref)")
 	flag.StringVar(&o.createdBy, "created-by", "loadgen", "value for the agents.x-k8s.io/created-by label")
 	flag.StringVar(&o.metricsAddr, "metrics-addr", ":9090", "Prometheus metrics listen address")
 	flag.IntVar(&o.concurrency, "concurrency", 1, "number of parallel claim workers (in-flight claims)")
