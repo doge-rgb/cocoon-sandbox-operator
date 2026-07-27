@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -198,6 +199,13 @@ type scatterGatherStore struct {
 	// node state still has to accept writes.
 	overlays sync.Map // "<ns>/<name>" -> SandboxOverlay
 
+	// pendingGen counts changes to the pending index. A claim the store just
+	// made is visible to readers immediately but moves no NodeInventory, so a
+	// watch that keyed only on inventory resourceVersions would not report it
+	// for a whole publish cycle — exactly the invisibility this index exists to
+	// remove.
+	pendingGen atomic.Uint64
+
 	// clock is time.Now unless a test replaces it to age pending entries.
 	clock func() time.Time
 }
@@ -351,6 +359,37 @@ func (s *scatterGatherStore) List(ctx context.Context, opts ListOptions) (*sandb
 // collection was built from. Kubernetes treats a resourceVersion as opaque, so
 // the only contract to honor is that it advances when the contents can have
 // changed — the max of the per-node inventory versions does exactly that.
+// collectionGeneration is a cheap fingerprint of everything a reader can see:
+// the newest resourceVersion across node inventories, plus the pending index's
+// counter. Inventory resourceVersions all come from one etcd, so any publish by
+// any node moves the maximum — which makes an unchanged fingerprint proof that
+// no visible sandbox changed, at O(nodes) instead of O(sandboxes).
+// A node whose inventory carries no usable resourceVersion makes the
+// fingerprint meaningless — it would stop moving and freeze the watch forever —
+// so that case reports "unknown" and the caller polls. Failing open costs CPU;
+// failing closed silently stops delivering events.
+func (s *scatterGatherStore) collectionGeneration(ctx context.Context) (string, bool) {
+	nodes, err := s.src.ListNodes(ctx)
+	if err != nil {
+		return "", false
+	}
+	var max uint64
+	for _, n := range nodes {
+		inv, err := s.src.NodeInventory(ctx, n)
+		if err != nil {
+			return "", false
+		}
+		v, err := strconv.ParseUint(inv.ResourceVersion, 10, 64)
+		if err != nil {
+			return "", false
+		}
+		if v > max {
+			max = v
+		}
+	}
+	return strconv.FormatUint(max, 10) + "@" + strconv.FormatUint(s.pendingGen.Load(), 10), true
+}
+
 func (s *scatterGatherStore) collectionResourceVersion(ctx context.Context, nodes []string) string {
 	var max uint64
 	for _, n := range nodes {
@@ -499,7 +538,9 @@ func (s *scatterGatherStore) Release(ctx context.Context, node, id string) error
 	// otherwise take a publish cycle to stop reporting it.
 	s.pending.Range(func(k, v any) bool {
 		if v.(*pendingClaim).entry.ID == id {
-			s.pending.Delete(k)
+			if _, loaded := s.pending.LoadAndDelete(k); loaded {
+				s.pendingGen.Add(1)
+			}
 			s.overlays.Delete(k)
 			return false
 		}
@@ -559,11 +600,17 @@ func (s *scatterGatherStore) forgetOverlay(namespace, name string) {
 // node's next inventory publish.
 func (s *scatterGatherStore) rememberClaim(namespace, name, node string, e InventoryEntry) {
 	s.pending.Store(namespace+"/"+name, &pendingClaim{node: node, entry: e, at: s.now()})
+	s.pendingGen.Add(1)
 }
 
-// forgetClaim drops a pending entry (released, or confirmed by inventory).
+// forgetClaim drops a pending entry (released, or confirmed by inventory). The
+// generation only moves when something was actually removed: this is called for
+// every entry of every inventory on every list, and a counter that ticked on
+// misses would defeat the change detection it feeds.
 func (s *scatterGatherStore) forgetClaim(namespace, name string) {
-	s.pending.Delete(namespace + "/" + name)
+	if _, loaded := s.pending.LoadAndDelete(namespace + "/" + name); loaded {
+		s.pendingGen.Add(1)
+	}
 }
 
 // pendingFor returns the unconfirmed claim for namespace/name, if one is live.
@@ -575,7 +622,7 @@ func (s *scatterGatherStore) pendingFor(namespace, name string) (*pendingClaim, 
 	}
 	pc := v.(*pendingClaim)
 	if s.now().Sub(pc.at) > pendingTTL {
-		s.pending.Delete(namespace + "/" + name)
+		s.forgetClaim(namespace, name)
 		return nil, false
 	}
 	return pc, true
@@ -602,7 +649,9 @@ func (s *scatterGatherStore) unconfirmed(seen map[string]struct{}, namespace str
 		key := k.(string)
 		pc := v.(*pendingClaim)
 		if now.Sub(pc.at) > pendingTTL {
-			s.pending.Delete(key)
+			if _, loaded := s.pending.LoadAndDelete(key); loaded {
+				s.pendingGen.Add(1)
+			}
 			return true
 		}
 		if _, dup := seen[key]; dup {
@@ -774,6 +823,11 @@ func (s *scatterGatherStore) runWatch(ctx context.Context, opts ListOptions, w *
 		}
 	}
 
+	// lastGen is the collection fingerprint the emitted events correspond to.
+	// It starts empty so the first tick always polls, which repairs the gap
+	// between the initial list above and the first generation read.
+	var lastGen string
+
 	ticker := time.NewTicker(s.watchPoll)
 	defer ticker.Stop()
 	for {
@@ -783,10 +837,21 @@ func (s *scatterGatherStore) runWatch(ctx context.Context, opts ListOptions, w *
 		case <-w.done:
 			return
 		case <-ticker.C:
+			// Re-synthesizing the collection costs O(sandboxes) in both CPU and
+			// allocation — at fleet scale that is hundreds of megabytes of garbage
+			// per tick, per watcher, whether or not anything moved. Compare a
+			// fingerprint first and do the work only when it changed.
+			gen, trusted := s.collectionGeneration(ctx)
+			if trusted && gen == lastGen {
+				continue
+			}
 			list, err := s.List(ctx, opts)
 			if err != nil {
 				s.log.Error(err, "watch poll list failed")
 				continue
+			}
+			if trusted {
+				lastGen = gen
 			}
 			cur := make(map[string]*sandboxv1beta1.Sandbox, len(list.Items))
 			for i := range list.Items {
