@@ -39,6 +39,27 @@ func NewInventoryResolver(src scale.InventorySource) *InventoryResolver {
 	return &InventoryResolver{src: src}
 }
 
+// EntryAddr returns any node's sandboxd address, to enter the mesh through. The
+// mesh routes a lookup to the owner from wherever it arrives, so this only has
+// to name a node that answers — not the right one.
+func (r *InventoryResolver) EntryAddr(ctx context.Context) (string, error) {
+	if r.src == nil {
+		return "", fmt.Errorf("execgw: no inventory source configured")
+	}
+	nodes, err := r.src.ListNodes(ctx)
+	if err != nil {
+		return "", fmt.Errorf("execgw: enumerate nodes: %w", err)
+	}
+	for _, node := range nodes {
+		inv, err := r.src.NodeInventory(ctx, node)
+		if err != nil || inv.Address == "" {
+			continue
+		}
+		return inv.Address, nil
+	}
+	return "", fmt.Errorf("execgw: no node advertises a sandboxd address: %w", ErrUnknownSandbox)
+}
+
 // Resolve accepts either the raw sandboxd claim id or the DNS-safe rendering
 // the e2b surface publishes, and returns the claim id the node knows together
 // with that node's sandboxd address.

@@ -239,7 +239,7 @@ func run() error {
 	invSource := scale.NewClientInventorySource(reader)
 	// The data-plane gateway learns each sandbox's credential the only moment it
 	// is visible — when the claim mints it — because nothing durable records it.
-	gw := execgw.New(execgw.NewInventoryResolver(invSource), ctrl.Log.WithName("execgw"))
+	gw := execgw.New(execgw.NewInventoryResolver(invSource), token, ctrl.Log.WithName("execgw"))
 	store := scale.NewScatterGatherStore(
 		invSource,
 		scale.WithClaimRouting(token, scale.NewSandboxdClientFactory()),

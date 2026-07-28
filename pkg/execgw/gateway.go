@@ -45,13 +45,18 @@ import (
 	"github.com/go-logr/logr"
 )
 
-// Resolver reports where a sandbox lives. The address is the owning node's
-// sandboxd data-plane endpoint, which is what the SDK dials.
+// Resolver maps the id a client used to the claim id the fleet knows it by, and
+// names a node to enter the mesh through. It does not have to find the owner:
+// the mesh does that, and a lookup that only consulted published inventory
+// would answer "no such sandbox" for one claimed seconds ago.
 type Resolver interface {
-	// Resolve maps the id a client used to the claim id and node address the
-	// data plane needs. Implementations accept both the raw claim id and the
-	// DNS-safe rendering the e2b surface publishes.
+	// Resolve accepts the raw sandboxd claim id, the DNS-safe rendering the e2b
+	// surface publishes, or the Kubernetes object name, and returns the claim id.
 	Resolve(ctx context.Context, id string) (claimID, nodeAddr string, err error)
+	// EntryAddr returns any node's sandboxd address. Which one does not matter —
+	// every node can route a lookup to the owner — so a caller that already has
+	// a live address should keep using it rather than asking again.
+	EntryAddr(ctx context.Context) (string, error)
 }
 
 // ErrUnknownSandbox is returned when no node claims the requested id.
@@ -59,8 +64,9 @@ var ErrUnknownSandbox = errors.New("execgw: no node holds that sandbox")
 
 // Gateway turns a (sandbox id, token) pair into a live handle on the guest.
 type Gateway struct {
-	resolver Resolver
-	log      logr.Logger
+	resolver   Resolver
+	fleetToken string
+	log        logr.Logger
 
 	// clients are per-node SDK clients. The SDK's Client is a thin wrapper over
 	// an http.Client, and building one per request would discard every pooled
@@ -86,9 +92,16 @@ type claimed struct {
 	nodeAddr string
 }
 
-// New builds a Gateway over resolver.
-func New(resolver Resolver, log logr.Logger) *Gateway {
-	return &Gateway{resolver: resolver, log: log, clients: map[string]*sdk.Client{}}
+// New builds a Gateway over resolver. fleetToken is the uniform node credential
+// the mesh's peer discovery is read under; without it a lookup cannot scatter
+// and only sandboxes on the entry node are reachable.
+func New(resolver Resolver, fleetToken string, log logr.Logger) *Gateway {
+	return &Gateway{
+		resolver:   resolver,
+		fleetToken: fleetToken,
+		log:        log,
+		clients:    map[string]*sdk.Client{},
+	}
 }
 
 // RememberToken records the credential handed out when a sandbox was claimed,
@@ -159,7 +172,7 @@ func (g *Gateway) clientFor(addr string) (*sdk.Client, error) {
 	if c, ok := g.clients[addr]; ok {
 		return c, nil
 	}
-	c, err := sdk.Connect(addr)
+	c, err := sdk.Connect(addr, sdk.WithAPIToken(g.fleetToken))
 	if err != nil {
 		return nil, fmt.Errorf("execgw: connect to node %q: %w", addr, err)
 	}
@@ -173,32 +186,52 @@ func (g *Gateway) Open(ctx context.Context, id, suppliedToken string) (*sdk.Sand
 	if id == "" {
 		return nil, fmt.Errorf("execgw: no sandbox id in request")
 	}
-	// A sandbox claimed moments ago is in no published inventory yet — node
-	// state is republished on a slow cadence — so what the claim itself told us
-	// is both fresher and cheaper than a fleet scan. Fall back to the scan for
-	// sandboxes this process never saw claimed.
 	claimID, addr := id, ""
-	if c, ok := g.remembered(id); ok && c.nodeAddr != "" {
+	if c, ok := g.remembered(id); ok {
+		// The claim itself said where the sandbox landed, which costs nothing to
+		// reuse and is correct the instant it is made.
 		claimID, addr = c.claimID, c.nodeAddr
-	} else {
-		var err error
-		claimID, addr, err = g.resolver.Resolve(ctx, id)
-		if err != nil {
-			return nil, err
-		}
+	} else if cid, _, err := g.resolver.Resolve(ctx, id); err == nil {
+		claimID = cid
+	} else if suppliedToken == "" {
+		// Nothing remembered, nothing in the fleet, and no credential offered.
+		// Which of those it is decides what the caller can do about it, so
+		// report the absence rather than the missing credential: a caller told
+		// to supply a token it has no way to obtain learns nothing.
+		return nil, err
 	}
-	if addr == "" {
-		return nil, fmt.Errorf("execgw: sandbox %q advertises no node address: %w", id, ErrUnknownSandbox)
-	}
+
 	tok, ok := g.token(claimID, suppliedToken)
 	if !ok {
 		return nil, fmt.Errorf("execgw: no credential for sandbox %q; pass it as a bearer token", id)
 	}
-	c, err := g.clientFor(addr)
+
+	if addr != "" {
+		c, err := g.clientFor(addr)
+		if err != nil {
+			return nil, err
+		}
+		return c.Attach(addr, claimID, tok), nil
+	}
+
+	// Nothing local to go on, so ask the mesh. Any node answers: it checks
+	// whether it owns the sandbox and otherwise scatters across its peers,
+	// first confirmation winning. That is what makes a sandbox reachable
+	// through this gateway no matter which node it landed on, and without
+	// waiting for node state to be republished.
+	entry, err := g.resolver.EntryAddr(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return c.Attach(addr, claimID, tok), nil
+	c, err := g.clientFor(entry)
+	if err != nil {
+		return nil, err
+	}
+	sb, err := c.Lookup(ctx, claimID, tok)
+	if err != nil {
+		return nil, fmt.Errorf("execgw: sandbox %q: %w", id, ErrUnknownSandbox)
+	}
+	return sb, nil
 }
 
 // bearer pulls a token out of the usual places a client might put one. The e2b

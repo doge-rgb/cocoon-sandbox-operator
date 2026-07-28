@@ -20,6 +20,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-logr/logr"
 	"github.com/stretchr/testify/assert"
@@ -38,13 +39,15 @@ func (s stubResolver) Resolve(_ context.Context, id string) (string, string, err
 	return s.id, s.addr, nil
 }
 
+func (s stubResolver) EntryAddr(context.Context) (string, error) { return s.addr, nil }
+
 // TestRouterRejectsBeforeTouchingAGuest pins the failure modes a caller can
 // tell apart. The upstream SDK reports whatever status it gets, so a sandbox on
 // a drained node and a sandbox this gateway has no credential for must not both
 // arrive as the same opaque 502 — one is retryable elsewhere, the other needs a
 // token the caller has to supply.
 func TestRouterRejectsBeforeTouchingAGuest(t *testing.T) {
-	gw := New(stubResolver{id: "sb_known", addr: "10.0.0.1:7777"}, logr.Discard())
+	gw := New(stubResolver{id: "sb_known", addr: "10.0.0.1:7777"}, "fleet-token", logr.Discard())
 	h := gw.AgentSandboxHandler()
 
 	do := func(id string) *httptest.ResponseRecorder {
@@ -78,7 +81,7 @@ func TestRouterRejectsBeforeTouchingAGuest(t *testing.T) {
 // claim's token has to be recoverable from the claim itself or that whole
 // surface can only ever reach sandboxes created through some other API.
 func TestRememberedTokenSurvivesATokenlessCaller(t *testing.T) {
-	gw := New(stubResolver{id: "sb_known", addr: "10.0.0.1:7777"}, logr.Discard())
+	gw := New(stubResolver{id: "sb_known", addr: "10.0.0.1:7777"}, "fleet-token", logr.Discard())
 
 	_, ok := gw.token("sb_known", "")
 	assert.False(t, ok, "nothing is known before a claim happens")
@@ -155,4 +158,41 @@ func TestExecuteRunsAShellForABareCommand(t *testing.T) {
 	assert.Equal(t, []string{"go", "build", "./..."},
 		argvFor(ExecuteRequest{Command: "go", Args: []string{"build", "./..."}}),
 		"an explicit argv must reach the guest unchanged")
+}
+
+// meshResolver knows a sandbox exists but deliberately refuses to say where,
+// the way inventory does for one claimed seconds ago.
+type meshResolver struct{ claimID, entry string }
+
+func (m meshResolver) Resolve(_ context.Context, id string) (string, string, error) {
+	if id != m.claimID {
+		return "", "", ErrUnknownSandbox
+	}
+	return m.claimID, "", nil
+}
+func (m meshResolver) EntryAddr(context.Context) (string, error) { return m.entry, nil }
+
+// TestUnknownLocationFallsThroughToTheMesh pins why this gateway does not need
+// to know which node holds a sandbox. Every sandboxd can route a lookup to the
+// owner — it answers for its own and scatters to its peers otherwise — so the
+// gateway enters the mesh anywhere and lets it resolve. Depending on published
+// node state instead would make a sandbox unreachable for most of a minute
+// after it is claimed, which is exactly when a caller wants it.
+func TestUnknownLocationFallsThroughToTheMesh(t *testing.T) {
+	gw := New(meshResolver{claimID: "sb_here", entry: "10.0.0.9:7777"}, "fleet-token", logr.Discard())
+
+	// No remembered address and none from the resolver: the only way to reach
+	// the guest is through the mesh, so a client must be built for the entry
+	// node rather than the request being refused.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	_, err := gw.Open(ctx, "sb_here", "caller-token")
+	require.Error(t, err, "no node is actually listening in this test")
+	assert.NotContains(t, err.Error(), "no credential",
+		"a caller that supplied a token must not be told it lacked one")
+
+	gw.mu.Lock()
+	_, built := gw.clients["10.0.0.9:7777"]
+	gw.mu.Unlock()
+	assert.True(t, built, "the gateway must enter the mesh at the address the resolver named")
 }
