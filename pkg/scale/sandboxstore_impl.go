@@ -136,6 +136,28 @@ func WithOwnerUID(uid string) ClaimOption {
 	return func(c *claimConfig) { c.ownerUID = uid }
 }
 
+// ClaimInfo is everything a claim knows about the sandbox it just handed out.
+// A data-plane caller may name that sandbox either way — the Kubernetes clients
+// use the object name they created, e2b clients use the node's claim id — so
+// both identities travel together.
+type ClaimInfo struct {
+	ClaimID   string
+	Namespace string
+	Name      string
+	Token     string
+	NodeAddr  string
+}
+
+// WithClaimObserver registers a callback invoked with the identities, token and
+// owning node address of every sandbox this store hands out. The address rides
+// along because a sandbox is not in any node's published inventory for most of
+// a minute after it is claimed, and a data-plane call that arrives inside that
+// window would otherwise be told the sandbox does not exist. The callback must not block: it runs on
+// the claim path, which is the latency every caller measures.
+func WithClaimObserver(fn func(ClaimInfo)) StoreOption {
+	return func(s *scatterGatherStore) { s.claimObserver = fn }
+}
+
 // WithClock replaces the store's clock. Tests use it to age pending claims past
 // their TTL without sleeping.
 func WithClock(now func() time.Time) StoreOption {
@@ -205,6 +227,13 @@ type scatterGatherStore struct {
 	// for a whole publish cycle — exactly the invisibility this index exists to
 	// remove.
 	pendingGen atomic.Uint64
+
+	// claimObserver, when set, is told the credential a successful claim minted.
+	// It exists for the data-plane gateway: the token never appears in node
+	// inventory (a node must not publish credentials) and never lands in etcd,
+	// so a component that has to reach a guest later has no way to learn it
+	// except at the moment it is issued.
+	claimObserver func(ClaimInfo)
 
 	// clock is time.Now unless a test replaces it to age pending entries.
 	clock func() time.Time
@@ -501,6 +530,12 @@ func (s *scatterGatherStore) Claim(ctx context.Context, namespace, name string, 
 			return Assignment{}, fmt.Errorf("scale: claim %s/%s: node %q warm-raced: %w", namespace, name, node, ErrNoWarmCapacity)
 		}
 		return Assignment{}, fmt.Errorf("scale: claim %s/%s on node %q: %w", namespace, name, node, err)
+	}
+	if s.claimObserver != nil {
+		s.claimObserver(ClaimInfo{
+			ClaimID: res.ID, Namespace: namespace, Name: name,
+			Token: res.Token, NodeAddr: res.OwnerAddr,
+		})
 	}
 	s.rememberClaim(namespace, name, node, InventoryEntry{
 		Name:     namespace + "/" + name,

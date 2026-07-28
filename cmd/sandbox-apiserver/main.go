@@ -44,6 +44,7 @@ import (
 
 	extv1beta1 "github.com/doge-rgb/cocoon-sandbox-operator/extensions/api/v1beta1"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/e2bcompat"
+	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/execgw"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale"
 	sandboxapiserver "github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale/apiserver"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale/warmpool"
@@ -91,6 +92,7 @@ type options struct {
 	// serves on its own address, so the aggregated API is never affected.
 	E2BAPI            bool
 	E2BAddr           string
+	RouterAddr        string
 	E2BNamespace      string
 	E2BDomain         string
 	E2BAPIKeyFile     string
@@ -105,6 +107,7 @@ func newOptions() *options {
 		Features:       genericoptions.NewFeatureOptions(),
 		WarmPoolDriver: true,
 		E2BAddr:        ":8080",
+		RouterAddr:     ":8081",
 		E2BNamespace:   "default",
 	}
 	o.SecureServing.BindPort = 6443
@@ -129,6 +132,11 @@ func (o *options) addFlags(fs *pflag.FlagSet) {
 		"Resync cadence for the SandboxWarmPool driver, and with it the sampling period of the warm count in pool status (0 = default 5s).")
 	fs.BoolVar(&o.E2BAPI, "enable-e2b-api", o.E2BAPI,
 		"Serve the e2b-compatible REST surface, so an unmodified e2b SDK can claim from the same warm pools (point E2B_API_URL at it).")
+	fs.StringVar(&o.RouterAddr, "router-bind-address", o.RouterAddr,
+		"address for the agent-sandbox data-plane router (/execute, /upload, ...). "+
+			"The upstream SDK sends no credential of its own, so this listener is "+
+			"protected by network position: publish it as an in-cluster Service "+
+			"(sandbox-router-svc) and do NOT put it behind a public address.")
 	fs.StringVar(&o.E2BAddr, "e2b-bind-address", o.E2BAddr,
 		"Address the e2b-compatible surface listens on.")
 	fs.StringVar(&o.E2BNamespace, "e2b-namespace", o.E2BNamespace,
@@ -229,9 +237,13 @@ func run() error {
 	// fleet token plus a per-node sandboxd HTTP client keyed on each node's
 	// advertised address (NodeInventory.Address). Empty token leaves it fail-closed.
 	invSource := scale.NewClientInventorySource(reader)
+	// The data-plane gateway learns each sandbox's credential the only moment it
+	// is visible — when the claim mints it — because nothing durable records it.
+	gw := execgw.New(execgw.NewInventoryResolver(invSource), ctrl.Log.WithName("execgw"))
 	store := scale.NewScatterGatherStore(
 		invSource,
 		scale.WithClaimRouting(token, scale.NewSandboxdClientFactory()),
+		scale.WithClaimObserver(gw.RememberToken),
 	)
 
 	// The SandboxWarmPool driver is the control-plane surface for warm capacity:
@@ -251,6 +263,11 @@ func run() error {
 	// and what it creates stays visible to `kubectl get sandboxes`.
 	if o.E2BAPI {
 		if err := startE2BServer(ctx, o, store, invSource); err != nil {
+			return err
+		}
+	}
+	if o.RouterAddr != "" {
+		if err := startRouter(ctx, o.RouterAddr, gw); err != nil {
 			return err
 		}
 	}
@@ -337,6 +354,35 @@ func startWarmPoolDriver(ctx context.Context, restCfg *restclient.Config, token 
 		if err := mgr.Start(ctx); err != nil {
 			klog.ErrorS(err, "warm-pool manager exited")
 		}
+	}()
+	return nil
+}
+
+// startRouter serves the upstream agent-sandbox data-plane protocol — the
+// /execute, /upload, /download, /list, /exists routes its SDK expects from a
+// component it calls sandbox-router-svc. Those clients address the whole fleet
+// through one endpoint and name their target in an X-Sandbox-ID header, which
+// is why this is a single listener rather than something per sandbox.
+//
+// It gets its own listener rather than sharing the e2b one because the two
+// protocols disagree about credentials: e2b clients present an API key on every
+// call, the agent-sandbox SDK presents nothing at all. Sharing a port would
+// force one of them to be wrong. Keep this listener inside the cluster.
+func startRouter(ctx context.Context, addr string, gw *execgw.Gateway) error {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("listen on router address %q: %w", addr, err)
+	}
+	srv := &http.Server{Handler: gw.AgentSandboxHandler(), ReadHeaderTimeout: e2bReadHeaderTimeout}
+	klog.InfoS("serving agent-sandbox data-plane router", "address", addr)
+	go func() {
+		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			klog.ErrorS(err, "agent-sandbox router exited")
+		}
+	}()
+	go func() {
+		<-ctx.Done()
+		_ = srv.Close()
 	}()
 	return nil
 }
