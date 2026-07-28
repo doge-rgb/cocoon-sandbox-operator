@@ -196,3 +196,17 @@ func TestUnknownLocationFallsThroughToTheMesh(t *testing.T) {
 	gw.mu.Unlock()
 	assert.True(t, built, "the gateway must enter the mesh at the address the resolver named")
 }
+
+// TestSandboxFromHostReadsTheOnlyIdentifierE2BSends pins the e2b addressing
+// scheme. Its client puts the sandbox nowhere in the request but the hostname —
+// "{port}-{sandboxID}.{domain}" — so a gateway that looked at paths or headers
+// would serve every call against whichever sandbox it guessed, or none.
+func TestSandboxFromHostReadsTheOnlyIdentifierE2BSends(t *testing.T) {
+	assert.Equal(t, "sb-abc123", sandboxFromHost("49983-sb-abc123.example.com"))
+	assert.Equal(t, "sb-abc123", sandboxFromHost("49983-sb-abc123.example.com:8081"),
+		"a port on the Host header must not become part of the id")
+	assert.Equal(t, "sb-abc123", sandboxFromHost("49983-sb-abc123"),
+		"a bare label, as a direct-to-gateway caller would send")
+	assert.Empty(t, sandboxFromHost("example.com"), "a host with no port prefix names no sandbox")
+	assert.Empty(t, sandboxFromHost(""))
+}

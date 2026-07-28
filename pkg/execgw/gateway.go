@@ -83,6 +83,14 @@ type Gateway struct {
 	// sees a token. Process-local on purpose: a credential written to etcd is a
 	// credential leaked to everything that can read it.
 	tokens sync.Map // claimID -> claimed
+
+	// byToken identifies a sandbox from the credential alone. An e2b client
+	// pointed at a fixed gateway URL — the deployment that needs no wildcard DNS
+	// — sends a Host header naming no sandbox, and then the per-sandbox token is
+	// the only thing in the request that says which one it means. Tokens are
+	// unguessable and issued one per sandbox, so this identifies as precisely as
+	// it authorizes.
+	byToken sync.Map // token -> claimID
 }
 
 // claimed is what the claim path told us about a sandbox.
@@ -119,6 +127,7 @@ func (g *Gateway) RememberToken(info scale.ClaimInfo) {
 	for _, k := range identities(info) {
 		g.tokens.Store(k, c)
 	}
+	g.byToken.Store(info.Token, info.ClaimID)
 }
 
 // identities lists the keys a sandbox can be addressed by.
@@ -140,6 +149,9 @@ func identities(info scale.ClaimInfo) []string {
 func (g *Gateway) ForgetToken(info scale.ClaimInfo) {
 	for _, k := range identities(info) {
 		g.tokens.Delete(k)
+	}
+	if info.Token != "" {
+		g.byToken.Delete(info.Token)
 	}
 }
 
@@ -232,6 +244,19 @@ func (g *Gateway) Open(ctx context.Context, id, suppliedToken string) (*sdk.Sand
 		return nil, fmt.Errorf("execgw: sandbox %q: %w", id, ErrUnknownSandbox)
 	}
 	return sb, nil
+}
+
+// sandboxForToken names the sandbox a credential belongs to, for callers whose
+// request carries no identifier of its own.
+func (g *Gateway) sandboxForToken(token string) (string, bool) {
+	if token == "" {
+		return "", false
+	}
+	v, ok := g.byToken.Load(token)
+	if !ok {
+		return "", false
+	}
+	return v.(string), true
 }
 
 // bearer pulls a token out of the usual places a client might put one. The e2b

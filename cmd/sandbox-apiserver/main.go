@@ -48,6 +48,8 @@ import (
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale"
 	sandboxapiserver "github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale/apiserver"
 	"github.com/doge-rgb/cocoon-sandbox-operator/pkg/scale/warmpool"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 )
 
 // inventoryCacheSyncTimeout bounds the startup wait for the NodeInventory
@@ -373,8 +375,26 @@ func startRouter(ctx context.Context, addr string, gw *execgw.Gateway) error {
 	if err != nil {
 		return fmt.Errorf("listen on router address %q: %w", addr, err)
 	}
-	srv := &http.Server{Handler: gw.AgentSandboxHandler(), ReadHeaderTimeout: e2bReadHeaderTimeout}
-	klog.InfoS("serving agent-sandbox data-plane router", "address", addr)
+	// One listener, two protocols. They cannot collide: the agent-sandbox routes
+	// are fixed paths this gateway defines, while every envd route lives under
+	// /process.Process/, /filesystem.Filesystem/ or /files. Splitting them across
+	// ports would mean publishing two endpoints for what is, to a caller, the
+	// same thing — the way into a sandbox.
+	router := gw.AgentSandboxHandler()
+	envd := gw.EnvdHandler()
+	mux := http.NewServeMux()
+	mux.Handle("/", router)
+	mux.Handle("/process.Process/", envd)
+	mux.Handle("/filesystem.Filesystem/", envd)
+	mux.Handle("/files", envd)
+	// h2c, because Connect's server streaming needs HTTP/2 and these listeners
+	// terminate no TLS: without it the e2b client's Start hangs at the first
+	// event instead of failing, which reads as a stuck sandbox.
+	srv := &http.Server{
+		Handler:           h2c.NewHandler(mux, &http2.Server{}),
+		ReadHeaderTimeout: e2bReadHeaderTimeout,
+	}
+	klog.InfoS("serving sandbox data plane (agent-sandbox router + envd)", "address", addr)
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			klog.ErrorS(err, "agent-sandbox router exited")
