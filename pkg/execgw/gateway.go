@@ -33,6 +33,7 @@ package execgw
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"net/http"
@@ -66,6 +67,7 @@ var ErrUnknownSandbox = errors.New("execgw: no node holds that sandbox")
 type Gateway struct {
 	resolver   Resolver
 	fleetToken string
+	apiKeys    []string
 	log        logr.Logger
 
 	// clients are per-node SDK clients. The SDK's Client is a thin wrapper over
@@ -100,16 +102,71 @@ type claimed struct {
 	nodeAddr string
 }
 
+// WithAPIKeys gates the data plane on a fleet-level credential. Without it the
+// gateway serves any caller that can reach the listener, which is only
+// defensible when the listener itself is unreachable from outside the cluster —
+// and the moment it is published that assumption stops holding silently.
+//
+// A per-sandbox token in the request is accepted instead: it authorizes exactly
+// one sandbox, which is strictly narrower than a fleet key.
+func WithAPIKeys(keys []string) Option {
+	return func(g *Gateway) { g.apiKeys = keys }
+}
+
+// Option configures a Gateway.
+type Option func(*Gateway)
+
 // New builds a Gateway over resolver. fleetToken is the uniform node credential
 // the mesh's peer discovery is read under; without it a lookup cannot scatter
 // and only sandboxes on the entry node are reachable.
-func New(resolver Resolver, fleetToken string, log logr.Logger) *Gateway {
-	return &Gateway{
+func New(resolver Resolver, fleetToken string, log logr.Logger, opts ...Option) *Gateway {
+	g := &Gateway{
 		resolver:   resolver,
 		fleetToken: fleetToken,
 		log:        log,
 		clients:    map[string]*sdk.Client{},
 	}
+	for _, o := range opts {
+		o(g)
+	}
+	return g
+}
+
+// authorize reports whether a request may drive the data plane at all. It is
+// deliberately coarse: proving the caller belongs here is separate from proving
+// which sandbox it may touch, and that second question is answered downstream by
+// the per-sandbox token every call ultimately carries to the guest.
+func (g *Gateway) authorize(r *http.Request) bool {
+	if len(g.apiKeys) == 0 {
+		return true
+	}
+	if presented := r.Header.Get("X-API-Key"); presented != "" {
+		for _, k := range g.apiKeys {
+			if subtle.ConstantTimeCompare([]byte(k), []byte(presented)) == 1 {
+				return true
+			}
+		}
+	}
+	// A caller holding a sandbox's own token needs no fleet key: it can only
+	// reach the one sandbox that token was minted for.
+	if tok := bearer(r); tok != "" {
+		if _, ok := g.sandboxForToken(tok); ok {
+			return true
+		}
+	}
+	return false
+}
+
+// Authenticated wraps h with the gateway's credential check.
+func (g *Gateway) Authenticated(h http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !g.authorize(r) {
+			writeErr(w, http.StatusUnauthorized,
+				"present X-API-Key, or the sandbox's own token as a bearer")
+			return
+		}
+		h.ServeHTTP(w, r)
+	})
 }
 
 // RememberToken records the credential handed out when a sandbox was claimed,

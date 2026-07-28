@@ -135,10 +135,11 @@ func (o *options) addFlags(fs *pflag.FlagSet) {
 	fs.BoolVar(&o.E2BAPI, "enable-e2b-api", o.E2BAPI,
 		"Serve the e2b-compatible REST surface, so an unmodified e2b SDK can claim from the same warm pools (point E2B_API_URL at it).")
 	fs.StringVar(&o.RouterAddr, "router-bind-address", o.RouterAddr,
-		"address for the agent-sandbox data-plane router (/execute, /upload, ...). "+
-			"The upstream SDK sends no credential of its own, so this listener is "+
-			"protected by network position: publish it as an in-cluster Service "+
-			"(sandbox-router-svc) and do NOT put it behind a public address.")
+		"address for the sandbox data plane: the agent-sandbox router (/execute, "+
+			"/upload, ...) and envd's protocol on one listener. Every call needs "+
+			"either an e2b API key or the sandbox's own token, so this is safe to "+
+			"publish; the upstream SDK sends neither on its own, and a caller "+
+			"supplies one through its HTTPTransport.")
 	fs.StringVar(&o.E2BAddr, "e2b-bind-address", o.E2BAddr,
 		"Address the e2b-compatible surface listens on.")
 	fs.StringVar(&o.E2BNamespace, "e2b-namespace", o.E2BNamespace,
@@ -241,7 +242,12 @@ func run() error {
 	invSource := scale.NewClientInventorySource(reader)
 	// The data-plane gateway learns each sandbox's credential the only moment it
 	// is visible — when the claim mints it — because nothing durable records it.
-	gw := execgw.New(execgw.NewInventoryResolver(invSource), token, ctrl.Log.WithName("execgw"))
+	gwKeys, err := o.e2bAPIKeys()
+	if err != nil {
+		return err
+	}
+	gw := execgw.New(execgw.NewInventoryResolver(invSource), token,
+		ctrl.Log.WithName("execgw"), execgw.WithAPIKeys(gwKeys))
 	store := scale.NewScatterGatherStore(
 		invSource,
 		scale.WithClaimRouting(token, scale.NewSandboxdClientFactory()),
@@ -391,7 +397,7 @@ func startRouter(ctx context.Context, addr string, gw *execgw.Gateway) error {
 	// terminate no TLS: without it the e2b client's Start hangs at the first
 	// event instead of failing, which reads as a stuck sandbox.
 	srv := &http.Server{
-		Handler:           h2c.NewHandler(mux, &http2.Server{}),
+		Handler:           h2c.NewHandler(gw.Authenticated(mux), &http2.Server{}),
 		ReadHeaderTimeout: e2bReadHeaderTimeout,
 	}
 	klog.InfoS("serving sandbox data plane (agent-sandbox router + envd)", "address", addr)

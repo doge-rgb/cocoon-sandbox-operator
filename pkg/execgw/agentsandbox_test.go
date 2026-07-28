@@ -210,3 +210,45 @@ func TestSandboxFromHostReadsTheOnlyIdentifierE2BSends(t *testing.T) {
 	assert.Empty(t, sandboxFromHost("example.com"), "a host with no port prefix names no sandbox")
 	assert.Empty(t, sandboxFromHost(""))
 }
+
+// TestDataPlaneRefusesUncredentialedCallersWhenGated pins what makes this
+// listener publishable. Its protocols carry no credential of their own — the
+// agent-sandbox SDK sends none at all — so an ungated listener is safe only
+// while it is unreachable, and nothing tells you when that stops being true.
+func TestDataPlaneRefusesUncredentialedCallersWhenGated(t *testing.T) {
+	gw := New(stubResolver{id: "sb_known", addr: "10.0.0.1:7777"}, "fleet-token",
+		logr.Discard(), WithAPIKeys([]string{"fleet-key"}))
+	h := gw.Authenticated(gw.AgentSandboxHandler())
+
+	// A short deadline: the addresses here answer nothing, and what this test
+	// asserts is the verdict at the gate, not what happens past it.
+	do := func(set func(*http.Request)) int {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		r := httptest.NewRequest(http.MethodPost, "/execute",
+			strings.NewReader(`{"command":"true"}`)).WithContext(ctx)
+		r.Header.Set(sandboxIDHeader, "sb_known")
+		if set != nil {
+			set(r)
+		}
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+
+	assert.Equal(t, http.StatusUnauthorized, do(nil), "no credential must not reach a guest")
+	assert.Equal(t, http.StatusUnauthorized,
+		do(func(r *http.Request) { r.Header.Set("X-API-Key", "wrong") }))
+
+	// A fleet key gets past the gate; the sandbox itself is still authorized
+	// downstream by its own token, which this gateway has not been told.
+	assert.Equal(t, http.StatusUnauthorized,
+		do(func(r *http.Request) { r.Header.Set("X-API-Key", "fleet-key") }),
+		"past the gate, but still no per-sandbox credential to reach the guest with")
+
+	// A caller holding one sandbox's token needs no fleet key.
+	gw.RememberToken(scale.ClaimInfo{ClaimID: "sb_known", Token: "sandbox-token", NodeAddr: "10.0.0.1:7777"})
+	assert.NotEqual(t, http.StatusUnauthorized,
+		do(func(r *http.Request) { r.Header.Set("Authorization", "Bearer sandbox-token") }),
+		"a per-sandbox token authorizes exactly its own sandbox")
+}
