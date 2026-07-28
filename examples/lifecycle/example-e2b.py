@@ -37,16 +37,18 @@ surface.
 
   * Reads are eventually consistent. Create returns as soon as the node-local
     claim completes, but every other verb resolves the sandbox through a view
-    synthesized from NodeInventory, which nodes republish on a ~30 s cadence.
-    The SDK does not retry on its own, so a create immediately followed by a
-    pause raises SandboxNotFoundException. `wait_visible` below polls with
-    ordinary SDK calls; see the README's L3 follow-up for the fix that removes
-    the window.
+    synthesized from NodeInventory. The apiserver keeps a read-your-writes index
+    of the claims it made, so a create is visible to the very next call and a
+    create immediately followed by a pause works; no settling wait is needed.
 
-Data-plane methods (`is_running`, `commands`, `files`, `pty`) are deliberately
-not exercised: they reach envd inside the guest at `{port}-{id}.{domain}`, which
-needs a wildcard domain routed to the sandboxes. Configure the server's
-`--e2b-domain` and that DNS before expecting them to work.
+Data-plane methods (`commands`, `files`) run against the gateway, which serves
+envd's protocol and re-issues each call into the guest.
+
+Where the SDK looks for that gateway depends on the deployment. With a wildcard
+domain routed to it the SDK finds it unaided — it dials `{port}-{id}.{domain}`.
+Without one, set `E2B_SANDBOX_URL` to the gateway; the Host header then names no
+sandbox, and the per-sandbox token the SDK already carries identifies it
+instead.
 """
 
 import argparse
@@ -63,33 +65,12 @@ from e2b.exceptions import SandboxException
 # means a mistyped --count cannot turn a demo into a load test.
 MAX_SANDBOXES = 100
 
-# VISIBILITY_TIMEOUT bounds the wait for the read view to publish a sandbox.
 # The publish cadence is ~30 s, so this is that plus room for a slow node.
-VISIBILITY_TIMEOUT = 90.0
 
 
 def step(name, detail=""):
     print(f"  {name:<18} {detail}", flush=True)
 
-
-def wait_visible(sandbox, timeout=VISIBILITY_TIMEOUT):
-    """Poll until the read view publishes the sandbox, using only SDK calls.
-
-    Returns the seconds waited. Raises if the sandbox never appears, which
-    means something worse than the publish lag went wrong.
-    """
-    deadline = time.monotonic() + timeout
-    started = time.monotonic()
-    while True:
-        try:
-            sandbox.get_info()
-            return time.monotonic() - started
-        except SandboxException:
-            if time.monotonic() > deadline:
-                raise TimeoutError(
-                    f"sandbox {sandbox.sandbox_id} not visible within {timeout}s"
-                )
-            time.sleep(0.5)
 
 
 def release_all():
@@ -115,10 +96,19 @@ def lifecycle_pass(template):
     sandbox = Sandbox.create(template, timeout=900, allow_internet_access=False)
     step("create", f"{sandbox.sandbox_id} in {(time.monotonic()-started)*1000:.0f} ms")
 
-    step("wait visible", f"{wait_visible(sandbox):.1f} s (NodeInventory publish lag)")
-
     info = sandbox.get_info()
     step("get_info", f"template={info.template_id}")
+
+    # The data plane. Everything else here delivers a sandbox; this is the part
+    # that uses one.
+    started = time.monotonic()
+    result = sandbox.commands.run("echo from-the-sandbox && uname -s")
+    step("commands.run", f"{(time.monotonic()-started)*1000:.0f} ms "
+                         f"exit={result.exit_code} stdout={result.stdout!r}")
+    started = time.monotonic()
+    sandbox.files.write("/tmp/example.txt", "written-by-example")
+    got = sandbox.files.read("/tmp/example.txt")
+    step("files", f"{(time.monotonic()-started)*1000:.0f} ms wrote and read back {got!r}")
     step("list", f"{sum(1 for _ in Sandbox.list().next_items())} sandbox(es)")
 
     sandbox.set_timeout(900)
@@ -164,11 +154,6 @@ def scale_pass(template, count):
         )
     step("create", f"{len(sandboxes)} in {time.monotonic()-started:.1f} s")
 
-    waited = time.monotonic()
-    with ThreadPoolExecutor(max_workers=16) as pool:
-        list(pool.map(wait_visible, sandboxes))
-    step("wait visible", f"all {len(sandboxes)} in {time.monotonic()-waited:.1f} s")
-
     paused = time.monotonic()
     with ThreadPoolExecutor(max_workers=16) as pool:
         list(pool.map(lambda s: s.pause(), sandboxes))
@@ -208,7 +193,9 @@ def main():
     if not os.environ.get("E2B_API_URL"):
         parser.error("set E2B_API_URL to this operator's e2b surface")
 
+    dataplane = os.environ.get("E2B_SANDBOX_URL")
     print(f"e2b SDK against {os.environ['E2B_API_URL']}")
+    print(f"  data plane: {dataplane or 'via {port}-{id}.{domain} (needs a wildcard domain)'}")
     try:
         leftover = release_all()
         if leftover:

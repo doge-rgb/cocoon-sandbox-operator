@@ -76,6 +76,7 @@ type options struct {
 	kubeconfig string
 	namespace  string
 	template   string
+	routerURL  string
 	e2bURL     string
 	e2bKey     string
 	keep       bool
@@ -86,6 +87,7 @@ func main() {
 	flag.StringVar(&o.kubeconfig, "kubeconfig", os.Getenv("KUBECONFIG"), "path to a kubeconfig; empty uses in-cluster config")
 	flag.StringVar(&o.namespace, "namespace", "default", "namespace to create sandboxes in")
 	flag.StringVar(&o.template, "template", "", "container image selecting the warm pool; empty discovers one from NodeInventory")
+	flag.StringVar(&o.routerURL, "router-url", "", "base URL of the data-plane router (/execute, /upload, ...); empty skips the data-plane half")
 	flag.StringVar(&o.e2bURL, "e2b-url", "", "base URL of the e2b-compatible surface; empty skips the e2b half")
 	flag.StringVar(&o.e2bKey, "e2b-key", "", "X-API-KEY for the e2b surface")
 	flag.BoolVar(&o.keep, "keep", false, "leave the created sandboxes running instead of deleting them")
@@ -242,7 +244,20 @@ func runKubernetes(ctx context.Context, c client.Client, rc rest.Interface, o op
 	}
 	step("resume", "took %s (mmap restore fast path)", time.Since(start).Round(time.Millisecond))
 
-	// 7. Delete — releases the claim back to the node's pool.
+	// 7. The data plane. Everything above is the control plane: it delivers a
+	//    sandbox but never enters it. Running something inside goes through the
+	//    router, which speaks the upstream agent-sandbox protocol and addresses
+	//    a sandbox by the header rather than the URL, because one router serves
+	//    the whole fleet.
+	if o.routerURL != "" {
+		if err := exerciseDataPlane(ctx, o, name); err != nil {
+			return err
+		}
+	} else {
+		step("exec", "skipped (-router-url not set)")
+	}
+
+	// 8. Delete — releases the claim back to the node's pool.
 	if o.keep {
 		step("delete", "skipped (-keep)")
 		return nil
@@ -251,6 +266,75 @@ func runKubernetes(ctx context.Context, c client.Client, rc rest.Interface, o op
 		return fmt.Errorf("delete Sandbox: %w", err)
 	}
 	step("delete", "released %s/%s", o.namespace, name)
+	return nil
+}
+
+// exerciseDataPlane runs a command and round-trips a file through the router.
+//
+// The sandbox is named in the X-Sandbox-ID header, and either identity works:
+// the Kubernetes object name used here, or the node's claim id that the e2b
+// surface publishes. No token is sent — the router serves the upstream protocol,
+// which has nowhere to carry one, so it is reachable only from inside the
+// cluster and relies on that rather than on a credential in the request.
+func exerciseDataPlane(ctx context.Context, o options, name string) error {
+	type execRequest struct {
+		Command string `json:"command"`
+	}
+	type execResult struct {
+		Stdout   string `json:"stdout"`
+		Stderr   string `json:"stderr"`
+		ExitCode int    `json:"exit_code"`
+	}
+
+	call := func(method, path string, body []byte, out any) error {
+		req, err := http.NewRequestWithContext(ctx, method, o.routerURL+path, bytes.NewReader(body))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("X-Sandbox-ID", name)
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			return err
+		}
+		defer resp.Body.Close()
+		payload, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 300 {
+			return fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, payload)
+		}
+		if out == nil {
+			return nil
+		}
+		if s, ok := out.(*string); ok {
+			*s = string(payload)
+			return nil
+		}
+		return json.Unmarshal(payload, out)
+	}
+
+	// The whole command line goes in one string; the router puts a shell around
+	// it, the way the upstream clients expect.
+	body, err := json.Marshal(execRequest{Command: "echo from-the-sandbox && uname -s"})
+	if err != nil {
+		return err
+	}
+	var res execResult
+	start := time.Now()
+	if err := call(http.MethodPost, "/execute", body, &res); err != nil {
+		return fmt.Errorf("execute: %w", err)
+	}
+	step("exec", "%s exit=%d stdout=%q",
+		time.Since(start).Round(time.Millisecond), res.ExitCode, res.Stdout)
+
+	const guestPath = "/tmp/example.txt"
+	if err := call(http.MethodPost, "/upload?path="+guestPath, []byte("written-by-example"), nil); err != nil {
+		return fmt.Errorf("upload: %w", err)
+	}
+	var got string
+	if err := call(http.MethodGet, "/download"+guestPath, nil, &got); err != nil {
+		return fmt.Errorf("download: %w", err)
+	}
+	step("files", "wrote and read back %q", got)
 	return nil
 }
 
